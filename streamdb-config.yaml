@@ -1,0 +1,3 @@
+host: ":10203"
+postgresUrl: "postgresql://postgres:ceb43a1233c55f2aed4d32c599b30bf2@localhost:5432/postgres"
+authToken: ba2287ff975093a7870add107fc47bab
