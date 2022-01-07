@@ -7,3 +7,76 @@ Valid aggregations:
 
 Protocol:
     
+
+# Example:
+
+
+for record1 in log:
+    for record2 in other_log:
+        if record1.key == record2.admissible:
+            mark record1.value
+
+
+[]
+
+for each function I just need to know:
+    how to adjust on derivative
+
+
+last(x, 3)
+value_in(x, column, y)
+    needs group_by(x, column)
+
+group_by(x, column)
+value_in(x, column, adjustable_list)
+newer_than(x, id)
+most_recent(x)
+
+last(
+    value_in(
+        group_by(task_status, user_id),
+        task_id,
+        [3, 4, 5],
+    ),
+    1,
+)
+
+filters:
+    Optional split table into effective subtables by column
+    1. Only records newer than id = x (x changeable)
+    2. Only records with column c in [a, b, c, ...] (a, b, c, ... changeable)
+    3. Only the most recent k records (k changeable)
+
+
+Things I want to be able to do:
+    most recent record grouped by user_id, filtered to a given list of user_ids
+    most recent record grouped by task_id, filtered to a given list of task_ids
+    most recent submission grouped by name, no filter
+    most recent record
+    all records newer than x
+    all records filtered to a given list of task_ids
+
+
+single unified thing:
+
+    group by column
+        take most recent
+
+
+
+subscriptions:
+    All:
+        [r1, r2, r3]
+    MostRecent:
+        [r3]
+    GroupBy:
+        a: [r1, r2]
+        b: [r3]
+    GroupByMostRecent:
+        a: [r2]
+        b: [r3]
+
+cursor:
+    All:
+        know about 2
+

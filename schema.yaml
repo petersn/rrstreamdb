@@ -1,0 +1,34 @@
+tables:
+  Jobs:
+    fields:
+      name: Text
+      username: Text
+      git_commit: Text
+      relaunch_command: Text
+      command: JSON
+
+  JobStatus:
+    fields:
+      job_id: Integer
+      status: ["active", "closed"]
+
+  Tasks:
+    fields:
+      job_id: Integer
+      relaunch_command: Text
+      parameters: JSON
+
+  TaskStatus:
+    fields:
+      task_id: Integer
+      status: ["pending", "queued", "running", "done", "crashed", "killed", "cancelled", "paused", "webpdb"]
+      return_code: NullableInteger
+
+subscriptions:
+  #Foo:
+  #  table: JobStatus
+  #  mostRecent: false
+  JobStatuses:
+    table: JobStatus
+    groupBy: job_id
+    mostRecent: false
