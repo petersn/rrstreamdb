@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -103,13 +104,26 @@ type ClientState struct {
 	Cursors            map[int64]*SubscriptionCursor
 }
 
+type WakeUpMessage struct {
+}
+
 type Server struct {
 	Config        *ServerConfig
 	Schema        *ServerSchema
+	DatabaseMutex sync.Mutex
 	Database      *sql.DB
-	Mux           sync.Mutex
-	Clients       map[chan string]*ClientState
+	Mutex         sync.RWMutex
+	Clients       map[chan WakeUpMessage]*ClientState
 	Subscriptions map[string]*SubscriptionState
+}
+
+func LOCKMESSAGE(x string) {
+	fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
+}
+
+func WriteMessage(conn *websocket.Conn, message []byte) error {
+	//fmt.Printf("\x1b[92mSend[%p]:\x1b[0m %s\n", conn, message)
+	return conn.WriteMessage(websocket.TextMessage, message)
 }
 
 func (serv *Server) RefreshSubscription(subName string) error {
@@ -148,6 +162,8 @@ func (serv *Server) RefreshSubscription(subName string) error {
 	}
 
 	// Read all of the corresponding rows
+	serv.DatabaseMutex.Lock()
+	defer serv.DatabaseMutex.Unlock()
 	rows, err := serv.Database.Query(query)
 	if err != nil {
 		log.Fatalf("could not execute query: %#v", err)
@@ -247,6 +263,7 @@ func (serv *Server) CatchUpCursor(conn *websocket.Conn, token int64, cursor *Sub
 	if subState.SubscriptionSpec.GroupByColumn == "" {
 		addRows(cursor.Cursor, &subState.RegularRows)
 		cursor.Cursor = subState.RegularRows.MostRecentId
+		//fmt.Printf("\x1b[91mUpdating to: %v\x1b[0m\n", subState.RegularRows.MostRecentId)
 	} else {
 		for cursorFilterValue, largestSeen := range cursor.FilterCursors {
 			//fmt.Printf("Got here: %v %#v\n%#v\n", token, cursor, subState)
@@ -256,7 +273,8 @@ func (serv *Server) CatchUpCursor(conn *websocket.Conn, token int64, cursor *Sub
 				continue
 			}
 			addRows(*largestSeen, ourGroup)
-			*cursor.FilterCursors[cursorFilterValue] = subState.RegularRows.MostRecentId
+			*cursor.FilterCursors[cursorFilterValue] = ourGroup.MostRecentId
+			//fmt.Printf("\x1b[91mUpdating to: %v\x1b[0m\n", ourGroup.MostRecentId)
 		}
 	}
 
@@ -274,7 +292,7 @@ func (serv *Server) CatchUpCursor(conn *websocket.Conn, token int64, cursor *Sub
 		if err != nil {
 			return err
 		}
-		err = conn.WriteMessage(websocket.TextMessage, bytes)
+		err = WriteMessage(conn, bytes)
 		if err != nil {
 			return err
 		}
@@ -295,6 +313,21 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 	// We're immediately done if we have no rows.
 	if rowData.Length == 0 {
 		return nil
+	}
+
+	// First we normalize the data to appropriate types.
+	for columnName, columnValues := range rowData.Data {
+		columnType, ok := tableDesc.Fields[columnName]
+		if !ok {
+			return errors.New("invalid column in data")
+		}
+		// Text, Float, Boolean, JSON, and enum types all already do the right thing.
+		// However, integers in JSON will get deserialized as float64s, which we must undo.
+		if columnType == "Integer" || columnType == "NullableInteger" {
+			for i, value := range columnValues {
+				columnValues[i] = int64(value.(float64))
+			}
+		}
 	}
 
 	var sb strings.Builder
@@ -321,6 +354,8 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 
 	ids := make([]interface{}, 0)
 	createdAts := make([]interface{}, 0)
+	serv.DatabaseMutex.Lock()
+	defer serv.DatabaseMutex.Unlock()
 	idTimestampRows, err := serv.Database.Query(sb.String(), values...)
 	if err != nil {
 		return err
@@ -345,6 +380,13 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	if rowData.Length == 0 {
 		return nil
 	}
+	//LOCKMESSAGE("RLOCK")
+	serv.Mutex.Lock()
+	defer func() {
+		//LOCKMESSAGE("RUnLOCK")
+		serv.Mutex.Unlock()
+	}()
+
 	// First we update all relevant subscriptions.
 	for _, subState := range serv.Subscriptions {
 		subSpec := subState.SubscriptionSpec
@@ -386,6 +428,15 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 			}
 		}
 	}
+
+	//pp.Print(serv.Subscriptions)
+
+	// Wake everyone up
+	// TODO: Properly only wake up folks waiting on these tables, or maybe even these  groups.
+	for channel, _ := range serv.Clients {
+		channel <- WakeUpMessage{}
+	}
+
 	return nil
 }
 
@@ -417,13 +468,23 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		clientState.WritePermissionBit = true
 	} else if subtle.ConstantTimeCompare(message, []byte(serv.Config.ReadToken)) == 0 {
 		log.Print("bad auth token")
-		c.WriteMessage(websocket.TextMessage, []byte("{\"kind\": \"error\", \"message\": \"bad auth token\"}"))
+		WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"bad auth token\"}"))
 		return
 	}
 
-	wakeupChannel := make(chan string)
+	wakeupChannel := make(chan WakeUpMessage, 128)
+	//LOCKMESSAGE("About to lock...")
+	serv.Mutex.Lock()
+	//LOCKMESSAGE("Got lock!")
 	serv.Clients[wakeupChannel] = clientState
-	defer delete(serv.Clients, wakeupChannel)
+	serv.Mutex.Unlock()
+	defer func() {
+		//LOCKMESSAGE("Locking")
+		serv.Mutex.Lock()
+		delete(serv.Clients, wakeupChannel)
+		//LOCKMESSAGE("Unlocking")
+		serv.Mutex.Unlock()
+	}()
 
 	messageChannel := make(chan string)
 	go func() {
@@ -434,6 +495,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				log.Println("read:", err)
 				break
 			}
+			//fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m %s\n", c, message)
 			messageChannel <- string(message)
 		}
 		close(messageChannel)
@@ -479,7 +541,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 
 			switch protocolRequest.Kind {
 			case "ping":
-				err = c.WriteMessage(websocket.TextMessage, []byte("{\"kind\": \"pong\"}"))
+				err = WriteMessage(c, []byte("{\"kind\": \"pong\"}"))
 				if err != nil {
 					log.Println("write:", err)
 					return
@@ -513,12 +575,12 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				}
 			case "query":
 				if _, ok := serv.Schema.Subscriptions[protocolRequest.Subscription]; ok {
-					subState := SubscriptionCursor{
+					subCursor := SubscriptionCursor{
 						SubscriptionName: protocolRequest.Subscription,
 						Cursor:           protocolRequest.Cursor,
 						FilterCursors:    filterCursors,
 					}
-					err = serv.CatchUpCursor(c, -1, &subState)
+					err = serv.CatchUpCursor(c, -1, &subCursor)
 					// FIXME: Properly handle err here
 					goto good
 				} else {
@@ -561,7 +623,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					log.Println("json marshal:", err)
 					return
 				}
-				err = c.WriteMessage(websocket.TextMessage, bytes)
+				err = WriteMessage(c, bytes)
 				if err != nil {
 					log.Println("write:", err)
 					return
@@ -578,7 +640,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 
 		bad:
 			log.Printf("bad request: %#v", errorMessage)
-			err = c.WriteMessage(websocket.TextMessage, []byte(
+			err = WriteMessage(c, []byte(
 				fmt.Sprintf("{\"kind\": \"error\", \"message\": \"%s\"}", errorMessage),
 			))
 			if err != nil {
@@ -588,12 +650,16 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			continue
 
 		good:
-			err = c.WriteMessage(websocket.TextMessage, []byte("{\"kind\": \"ok\"}"))
+			err = WriteMessage(c, []byte("{\"kind\": \"ok\"}"))
 			if err != nil {
 				log.Println("write:", err)
 				return
 			}
 		case <-wakeupChannel:
+			for token, subCursor := range clientState.Cursors {
+				err = serv.CatchUpCursor(c, token, subCursor)
+				// FIXME: TODO: Handle the error
+			}
 			//log.Println("wake up for wakeup channel")
 			//c.WriteMessage()
 		}
@@ -660,23 +726,23 @@ func main() {
 		for tableName, tableSpec := range schema.Tables {
 			var sb strings.Builder
 			fmt.Fprintf(&sb, "CREATE TABLE IF NOT EXISTS %s (id SERIAL PRIMARY KEY, created_at TIMESTAMP WITH TIME ZONE NOT NULL", tableName)
-			for field, value := range tableSpec.Fields {
-				switch value := value.(type) {
+			for field, fieldType := range tableSpec.Fields {
+				switch fieldType := fieldType.(type) {
 				case string:
-					sqlType, ok := sqlTypeMapping[value]
+					sqlType, ok := sqlTypeMapping[fieldType]
 					if !ok {
-						panic(fmt.Sprintf("Unknown type in schema: %s", value))
+						panic(fmt.Sprintf("Unknown type in schema: %s", fieldType))
 					}
 					fmt.Fprintf(&sb, ", %s %s", field, sqlType)
 				case []interface{}:
 					enumOptions := make([]string, 0)
-					for _, x := range value {
+					for _, x := range fieldType {
 						// Horrible injection issue here. TODO: Properly escape this.
 						enumOptions = append(enumOptions, fmt.Sprintf("'%s'", x.(string)))
 					}
 					fmt.Fprintf(&sb, ", %s TEXT NOT NULL CHECK (%s in (%s))", field, field, strings.Join(enumOptions, ", "))
 				default:
-					panic(fmt.Sprintf("Unexpected value for field %#v in schema: %#v", field, value))
+					panic(fmt.Sprintf("Unexpected type for field %#v in schema: %#v", field, fieldType))
 				}
 			}
 			fmt.Fprint(&sb, ")")
@@ -694,7 +760,7 @@ func main() {
 		Config:        &config,
 		Schema:        &schema,
 		Database:      db,
-		Clients:       make(map[chan string]*ClientState),
+		Clients:       make(map[chan WakeUpMessage]*ClientState),
 		Subscriptions: make(map[string]*SubscriptionState),
 	}
 

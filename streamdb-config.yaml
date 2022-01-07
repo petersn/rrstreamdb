@@ -2,3 +2,4 @@ postgresUrl: "postgresql://postgres:ceb43a1233c55f2aed4d32c599b30bf2@localhost:5
 readToken:      r-ba2287ff975093a7870add107fc47bab
 readWriteToken: w-eabea13cb6770af75e93670c238647e4
 adminToken:     a-aafcb3d0a44b1af3a0d4da209ba98b88
+sqlPollingInterval: 1
