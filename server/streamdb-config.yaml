@@ -1,5 +1,41 @@
 postgresUrl: "postgresql://postgres:ceb43a1233c55f2aed4d32c599b30bf2@localhost:5432/postgres"
-readToken:      r-ba2287ff975093a7870add107fc47bab
-readWriteToken: w-eabea13cb6770af75e93670c238647e4
-adminToken:     a-aafcb3d0a44b1af3a0d4da209ba98b88
+hmacSecret: "aafcb3d0a44b1af3a0d4da209ba98b88"
 sqlPollingInterval: 1
+#enableTLS: true
+#certFile: cert.pem
+#keyFile: key.pem
+
+tables:
+  Jobs:
+    fields:
+      name: Text
+      username: Text
+      git_commit: Text
+      relaunch_command: Text
+      command: JSON
+
+  JobStatus:
+    fields:
+      job_id: Integer
+      status: ["active", "closed"]
+
+  Tasks:
+    fields:
+      job_id: Integer
+      relaunch_command: Text
+      parameters: JSON
+
+  TaskStatus:
+    fields:
+      task_id: Integer
+      status: ["pending", "queued", "running", "done", "crashed", "killed", "cancelled", "paused", "webpdb"]
+      return_code: NullableInteger
+
+subscriptions:
+  Foo:
+    table: JobStatus
+    mostRecent: false
+  JobStatuses:
+    table: JobStatus
+    groupBy: job_id
+    mostRecent: false

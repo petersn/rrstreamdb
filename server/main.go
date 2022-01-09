@@ -1,8 +1,11 @@
 package main
 
 import (
-	"crypto/subtle"
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,14 +13,20 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+
 	_ "github.com/lib/pq"
 	"gopkg.in/yaml.v2"
 )
+
+const version = "v0.0"
+
+var debugMode = false
 
 var sqlTypeMapping = map[string]string{
 	"Text":            "TEXT NOT NULL",
@@ -52,36 +61,37 @@ func (dr *DataRows) Recompute() {
 }
 
 type ServerConfig struct {
-	PostgresUrl    string `yaml:"postgresUrl"`
-	Host           string `yaml:"host"`
-	ReadToken      string `yaml:"readToken"`
-	ReadWriteToken string `yaml:"readWriteToken"`
-	AdminToken     string `yaml:"adminToken"`
-}
+	PostgresUrl string `yaml:"postgresUrl"`
+	Host        string `yaml:"host"`
+	HmacSecret  string `yaml:"hmacSecret"`
+	CertFile    string `yaml:"certFile"`
+	KeyFile     string `yaml:"keyFile"`
+	EnableTLS   bool   `yaml:"enableTLS"`
+	DebugMode   bool   `yaml:"debugMode"`
 
-type SubscriptionSpec struct {
-	TableName     string `yaml:"table"`
-	GroupByColumn string `yaml:"groupBy"` // "" means no grouping
-	MostRecent    bool   `yaml:"mostRecent"`
-}
-
-type ServerSchema struct {
+	// Schema part
 	Tables map[string]struct {
-		Fields map[string]interface{} `yaml:"fields"`
+		Fields map[string]interface{} `yaml:"fields" json:"fields"`
 	} `yaml:"tables"`
 	Subscriptions map[string]SubscriptionSpec `yaml:"subscriptions"`
 }
 
+type SubscriptionSpec struct {
+	TableName     string `yaml:"table" json:"table"`
+	GroupByColumn string `yaml:"groupBy" json:"groupyBy,omitempty"` // "" means no grouping
+	MostRecent    bool   `yaml:"mostRecent" json:"mostRecent"`
+}
+
 type ProtocolRequest struct {
-	Kind          string                 `json:"kind"`
-	Token         int64                  `json:"token"`
-	Subscription  string                 `json:"subscription"`
-	Table         string                 `json:"table"`
-	Cursor        int64                  `json:"cursor"`
-	FilterCursors [][]interface{}        `json:"filterCursors"`
-	Limit         int                    `json:"limit"`
-	Row           map[string]interface{} `json:"row"`
-	Rows          DataRows               `json:"rows"`
+	Kind          string                   `json:"kind"`
+	Token         int64                    `json:"token"`
+	Subscription  string                   `json:"subscription"`
+	Table         string                   `json:"table"`
+	Cursor        int64                    `json:"cursor"`
+	FilterCursors [][]interface{}          `json:"groups"`
+	Limit         int                      `json:"limit"`
+	Row           map[string]interface{}   `json:"row"`
+	Rows          map[string][]interface{} `json:"rows"`
 }
 
 type SubscriptionCursor struct {
@@ -99,6 +109,7 @@ type SubscriptionState struct {
 }
 
 type ClientState struct {
+	ValidityUntilUnix  int64
 	WritePermissionBit bool
 	AdminPermissionBit bool
 	Cursors            map[int64]*SubscriptionCursor
@@ -109,7 +120,6 @@ type WakeUpMessage struct {
 
 type Server struct {
 	Config        *ServerConfig
-	Schema        *ServerSchema
 	DatabaseMutex sync.Mutex
 	Database      *sql.DB
 	Mutex         sync.RWMutex
@@ -122,13 +132,15 @@ func LOCKMESSAGE(x string) {
 }
 
 func WriteMessage(conn *websocket.Conn, message []byte) error {
-	//fmt.Printf("\x1b[92mSend[%p]:\x1b[0m %s\n", conn, message)
+	if debugMode {
+		fmt.Printf("\x1b[92mSend[%p]:\x1b[0m %s\n", conn, message)
+	}
 	return conn.WriteMessage(websocket.TextMessage, message)
 }
 
 func (serv *Server) RefreshSubscription(subName string) error {
 	//fmt.Printf("\x1b[91mRefreshing subscription\x1b[0m: %s\n", subName)
-	subSpec := serv.Schema.Subscriptions[subName]
+	subSpec := serv.Config.Subscriptions[subName]
 	subState := SubscriptionState{SubscriptionSpec: subSpec}
 	if subSpec.GroupByColumn == "" {
 		subState.RegularRows = DataRows{
@@ -242,8 +254,15 @@ func binarySearchForNewRecords(largestSeen int64, rowData *DataRows) int {
 	return len(ids)
 }
 
-func (serv *Server) CatchUpCursor(conn *websocket.Conn, token int64, cursor *SubscriptionCursor) error {
-	//fmt.Printf("\x1b[91mCatch up cursor\x1b[0m: %v\n", cursor)
+func (serv *Server) CatchUpCursor(
+	conn *websocket.Conn,
+	token int64,
+	cursor *SubscriptionCursor,
+	sendEmpty bool,
+) error {
+	//if debugMode {
+	//	fmt.Printf("\x1b[91mCatch up cursor\x1b[0m: %v\n", cursor)
+	//}
 	retrievedData := make(map[string][]interface{})
 	addRows := func(largestSeen int64, rowData *DataRows) {
 		newIndex := binarySearchForNewRecords(largestSeen, rowData)
@@ -274,12 +293,13 @@ func (serv *Server) CatchUpCursor(conn *websocket.Conn, token int64, cursor *Sub
 			}
 			addRows(*largestSeen, ourGroup)
 			*cursor.FilterCursors[cursorFilterValue] = ourGroup.MostRecentId
-			//fmt.Printf("\x1b[91mUpdating to: %v\x1b[0m\n", ourGroup.MostRecentId)
+			//if debugMode {
+			//	fmt.Printf("\x1b[91mUpdating to: %v\x1b[0m\n", ourGroup.MostRecentId)
+			//}
 		}
 	}
 
-	// If token is -1 then we're answering a query and respond with even empty queries
-	if token == -1 || len(retrievedData) > 0 {
+	if sendEmpty || len(retrievedData) > 0 {
 		bytes, err := json.Marshal(struct {
 			Kind  string                   `json:"kind"`
 			Token int64                    `json:"token"`
@@ -301,7 +321,7 @@ func (serv *Server) CatchUpCursor(conn *websocket.Conn, token int64, cursor *Sub
 }
 
 func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
-	tableDesc, ok := serv.Schema.Tables[tableName]
+	tableDesc, ok := serv.Config.Tables[tableName]
 	if !ok {
 		return fmt.Errorf("unknown table for append: %#v", tableName)
 	}
@@ -309,6 +329,10 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 	for key := range tableDesc.Fields {
 		columnNames = append(columnNames, key)
 	}
+
+	//if debugMode {
+	//	fmt.Printf("\x1b[96mAppend rows: %v\x1b[0m\n", rowData.Length)
+	//}
 
 	// We're immediately done if we have no rows.
 	if rowData.Length == 0 {
@@ -329,6 +353,7 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 			}
 		}
 	}
+	// TODO: Make sure that every column is present, and they all have the same length
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "INSERT INTO %s (created_at", tableName)
@@ -351,6 +376,10 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 	}
 	fmt.Fprint(&sb, " RETURNING id, created_at")
 	//fmt.Println(sb.String())
+
+	//if debugMode {
+	//	fmt.Printf("\x1b[96mQuery formed\x1b[0m\n")
+	//}
 
 	ids := make([]interface{}, 0)
 	createdAts := make([]interface{}, 0)
@@ -377,6 +406,9 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 }
 
 func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) error {
+	//if debugMode {
+	//	fmt.Printf("\x1b[96mUpdating subscriptions!\x1b[0m\n")
+	//}
 	if rowData.Length == 0 {
 		return nil
 	}
@@ -432,7 +464,11 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	//pp.Print(serv.Subscriptions)
 
 	// Wake everyone up
-	// TODO: Properly only wake up folks waiting on these tables, or maybe even these  groups.
+	// TODO: Properly only wake up folks waiting on these tables, or maybe even these groups.
+	//if debugMode {
+	//	fmt.Printf("\x1b[95mSending wake ups\x1b[0m\n")
+	//	pp.Print(serv.Clients)
+	//}
 	for channel, _ := range serv.Clients {
 		channel <- WakeUpMessage{}
 	}
@@ -440,7 +476,99 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	return nil
 }
 
+/*
+func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
+	authString, ok := r.Header["Authorization"]
+	if !ok || len(authString) != 1 {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	parts := strings.Split(authString[0], " ")
+	if len(parts) != 2 || parts[0] != "Basic" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	authToken, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	usernameAndPasswordParts := strings.SplitN(string(authToken), ":", 2)
+	if len(usernameAndPasswordParts) != 2 {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	clientState, err := serv.MakeClient([]byte(usernameAndPasswordParts[1]))
+	if err != nil {
+		json.NewEncoder(w).Encode(struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		}{
+			Kind:    "error",
+			Message: fmt.Sprint(err),
+		})
+		return
+	}
+	_ = clientState
+	json.NewEncoder(w).Encode(struct {
+		Kind    string `json:"kind"`
+		Message string `json:"message"`
+	}{
+		Kind:    "success",
+		Message: "ok",
+	})
+}
+*/
+
+func (serv *Server) MakeClient(authToken []byte) (*ClientState, error) {
+	// Split into claim-signature
+	authTokenParts := bytes.SplitN(authToken, []byte("-"), 2)
+	if len(authTokenParts) != 2 {
+		return nil, errors.New("malformed auth token")
+	}
+	h := hmac.New(sha256.New, []byte(serv.Config.HmacSecret))
+	h.Write(authTokenParts[0])
+	// Get result and encode as hexadecimal string
+	tag := hex.EncodeToString(h.Sum(nil)[:16])
+	if !hmac.Equal([]byte(tag), authTokenParts[1]) {
+		return nil, errors.New("bad auth token")
+	}
+	// Split the claim into permissions.lastValidTimestamp.random
+	claimParts := strings.SplitN(string(authTokenParts[0]), ".", 3)
+	if len(claimParts) != 3 {
+		return nil, errors.New("malformed claim")
+	}
+	lastValidTimestamp, err := strconv.ParseInt(claimParts[1], 10, 64)
+	if err != nil {
+		return nil, errors.New("malformed claim")
+	}
+	if time.Now().Unix() > lastValidTimestamp {
+		return nil, errors.New("expired claim")
+	}
+
+	clientState := &ClientState{
+		ValidityUntilUnix:  lastValidTimestamp,
+		WritePermissionBit: false,
+		AdminPermissionBit: false,
+		Cursors:            make(map[int64]*SubscriptionCursor),
+	}
+	switch claimParts[0] {
+	case "r":
+		// Don't set any permissions
+	case "rw":
+		clientState.WritePermissionBit = true
+	case "admin":
+		clientState.WritePermissionBit = true
+		clientState.AdminPermissionBit = true
+	default:
+		return nil, errors.New("invalid permission level")
+	}
+	return clientState, nil
+}
+
 func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
+	var bytes []byte
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -456,21 +584,19 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientState := &ClientState{
-		Cursors: make(map[int64]*SubscriptionCursor),
-		//Subscriptions: make(map[int64]SubscriptionState),
-	}
-
-	if subtle.ConstantTimeCompare(message, []byte(serv.Config.AdminToken)) == 1 {
-		clientState.WritePermissionBit = true
-		clientState.AdminPermissionBit = true
-	} else if subtle.ConstantTimeCompare(message, []byte(serv.Config.ReadWriteToken)) == 1 {
-		clientState.WritePermissionBit = true
-	} else if subtle.ConstantTimeCompare(message, []byte(serv.Config.ReadToken)) == 0 {
-		log.Print("bad auth token")
-		WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"bad auth token\"}"))
+	clientState, err := serv.MakeClient(message)
+	if err != nil {
+		err = WriteMessage(c, []byte(
+			fmt.Sprintf("{\"kind\": \"error\", \"message\": \"%s\"}", err),
+		))
+		if err != nil {
+			log.Println("write:", err)
+			return
+		}
 		return
 	}
+
+	err = WriteMessage(c, []byte("{\"kind\": \"auth\"}"))
 
 	wakeupChannel := make(chan WakeUpMessage, 128)
 	//LOCKMESSAGE("About to lock...")
@@ -495,7 +621,9 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				log.Println("read:", err)
 				break
 			}
-			//fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m %s\n", c, message)
+			if debugMode {
+				fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m %s\n", c, message)
+			}
 			messageChannel <- string(message)
 		}
 		close(messageChannel)
@@ -507,6 +635,11 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			if message == "" {
 				return
 			}
+			if time.Now().Unix() > clientState.ValidityUntilUnix {
+				WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+				return
+			}
+
 			errorMessage := ""
 			filterCursors := make(map[interface{}]*int64)
 			var protocolRequest ProtocolRequest
@@ -567,37 +700,43 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				if !clientState.WritePermissionBit {
 					errorMessage = "permission denied"
 				} else {
-					err = serv.AppendRows(protocolRequest.Table, protocolRequest.Rows)
+					rowData := DataRows{
+						Data: protocolRequest.Rows,
+					}
+					rowData.Recompute()
+					err = serv.AppendRows(protocolRequest.Table, rowData)
 					if err == nil {
 						goto good
 					}
 					errorMessage = fmt.Sprintf("invalid appendBatch: %s", err)
 				}
 			case "query":
-				if _, ok := serv.Schema.Subscriptions[protocolRequest.Subscription]; ok {
+				if _, ok := serv.Config.Subscriptions[protocolRequest.Subscription]; ok {
 					subCursor := SubscriptionCursor{
 						SubscriptionName: protocolRequest.Subscription,
 						Cursor:           protocolRequest.Cursor,
 						FilterCursors:    filterCursors,
 					}
-					err = serv.CatchUpCursor(c, -1, &subCursor)
+					err = serv.CatchUpCursor(c, protocolRequest.Token, &subCursor, true)
 					// FIXME: Properly handle err here
-					goto good
+					//goto good
+					continue
 				} else {
-					errorMessage = "unknown subscription"
+					errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
 				}
 			case "subscribe":
-				if _, ok := serv.Schema.Subscriptions[protocolRequest.Subscription]; ok {
+				if _, ok := serv.Config.Subscriptions[protocolRequest.Subscription]; ok {
 					clientState.Cursors[protocolRequest.Token] = &SubscriptionCursor{
 						SubscriptionName: protocolRequest.Subscription,
 						Cursor:           protocolRequest.Cursor,
 						FilterCursors:    filterCursors,
 					}
-					err = serv.CatchUpCursor(c, protocolRequest.Token, clientState.Cursors[protocolRequest.Token])
+					err = serv.CatchUpCursor(c, protocolRequest.Token, clientState.Cursors[protocolRequest.Token], true)
 					// FIXME: Properly handle err here
-					goto good
+					//goto good
+					continue
 				} else {
-					errorMessage = "unknown subscription"
+					errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
 				}
 			case "unsubscribe":
 				if _, ok := clientState.Cursors[protocolRequest.Token]; ok {
@@ -607,17 +746,21 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					errorMessage = "unknown subscription token"
 				}
 			case "getSchema":
-				bytes, err := yaml.Marshal(serv.Schema)
-				if err != nil {
-					log.Println("yaml marshal:", err)
-					return
-				}
+				//bytes, err := yaml.Marshal(serv.Config)
+				//if err != nil {
+				//	log.Println("yaml marshal:", err)
+				//	return
+				//}
 				bytes, err = json.Marshal(struct {
-					Kind   string `json:"kind"`
-					Schema string `json:"schema"`
+					Kind          string      `json:"kind"`
+					Token         int64       `json:"token"`
+					Tables        interface{} `json:"tables"`
+					Subscriptions interface{} `json:"subscriptions"`
 				}{
-					Kind:   "getKind",
-					Schema: string(bytes),
+					Kind:          "getSchema",
+					Token:         protocolRequest.Token,
+					Tables:        serv.Config.Tables,
+					Subscriptions: serv.Config.Subscriptions,
 				})
 				if err != nil {
 					log.Println("json marshal:", err)
@@ -640,9 +783,20 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 
 		bad:
 			log.Printf("bad request: %#v", errorMessage)
-			err = WriteMessage(c, []byte(
-				fmt.Sprintf("{\"kind\": \"error\", \"message\": \"%s\"}", errorMessage),
-			))
+			bytes, err = json.Marshal(struct {
+				Kind    string `json:"kind"`
+				Token   int64  `json:"token"`
+				Message string `json:"message"`
+			}{
+				Kind:    "error",
+				Token:   protocolRequest.Token,
+				Message: errorMessage,
+			})
+			if err != nil {
+				log.Println("marshal:", err)
+				return
+			}
+			err = WriteMessage(c, bytes)
 			if err != nil {
 				log.Println("write:", err)
 				return
@@ -650,14 +804,24 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			continue
 
 		good:
-			err = WriteMessage(c, []byte("{\"kind\": \"ok\"}"))
+			// Token is an int64, I'm okay with not properly marshaling here.
+			err = WriteMessage(c, []byte(fmt.Sprintf("{\"kind\": \"ok\", \"token\": %v}", protocolRequest.Token)))
 			if err != nil {
 				log.Println("write:", err)
 				return
 			}
 		case <-wakeupChannel:
+			if time.Now().Unix() > clientState.ValidityUntilUnix {
+				WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+				return
+			}
+
+			//if debugMode {
+			//	fmt.Printf("\x1b[95mWake up: %p\x1b[0m\n", c)
+			//}
+
 			for token, subCursor := range clientState.Cursors {
-				err = serv.CatchUpCursor(c, token, subCursor)
+				err = serv.CatchUpCursor(c, token, subCursor, false)
 				// FIXME: TODO: Handle the error
 			}
 			//log.Println("wake up for wakeup channel")
@@ -668,8 +832,9 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	configPath := flag.String("config", "streamdb-config.yaml", "Config file to load")
-	schemaPath := flag.String("schema", "schema.yaml", "Schema of queries for the database")
+	makeAuthToken := flag.String("make-auth-token", "", "Make an auth token for a given claim")
 	applySchema := flag.Bool("apply-schema", false, "If true we create any required tables")
+	debugModeFlag := flag.Bool("debug-mode", false, "Print info on every message in and out")
 	flag.Parse()
 
 	// Parse the config file.
@@ -688,26 +853,18 @@ func main() {
 	if config.Host == "" {
 		config.Host = "0.0.0.0:10203"
 	}
-	if config.ReadToken == "" {
-		panic("Need to set ReadToken in config file")
-	}
-	if config.ReadWriteToken == "" {
-		panic("Need to set ReadWriteToken in config file")
-	}
-	if config.AdminToken == "" {
-		panic("Need to set AdminToken in config file")
+	if config.HmacSecret == "" {
+		panic("Need to set hmacSecret in config file")
 	}
 
-	// Parse the schema.
-	schemaYaml, err := ioutil.ReadFile(*schemaPath)
-	if err != nil {
-		panic(err)
+	if *makeAuthToken != "" {
+		h := hmac.New(sha256.New, []byte(config.HmacSecret))
+		h.Write([]byte(*makeAuthToken))
+		tag := hex.EncodeToString(h.Sum(nil)[:16])
+		fmt.Printf("%s-%s\n", *makeAuthToken, tag)
+		return
 	}
-	var schema ServerSchema
-	err = yaml.Unmarshal(schemaYaml, &schema)
-	if err != nil {
-		panic(err)
-	}
+	debugMode = config.DebugMode || *debugModeFlag
 
 	// Connect to the database.
 	db, err := sql.Open("postgres", config.PostgresUrl)
@@ -723,7 +880,7 @@ func main() {
 	if *applySchema {
 		// Warning: Injection is hella possible in the code in this block.
 		fmt.Println("Applying schema")
-		for tableName, tableSpec := range schema.Tables {
+		for tableName, tableSpec := range config.Tables {
 			var sb strings.Builder
 			fmt.Fprintf(&sb, "CREATE TABLE IF NOT EXISTS %s (id SERIAL PRIMARY KEY, created_at TIMESTAMP WITH TIME ZONE NOT NULL", tableName)
 			for field, fieldType := range tableSpec.Fields {
@@ -755,16 +912,18 @@ func main() {
 		return
 	}
 
+	if debugMode {
+		fmt.Print("\x1b[93mDebug mode\x1b[0m - ")
+	}
 	fmt.Printf("StreamDB binding to %s\n", config.Host)
 	server := Server{
 		Config:        &config,
-		Schema:        &schema,
 		Database:      db,
 		Clients:       make(map[chan WakeUpMessage]*ClientState),
 		Subscriptions: make(map[string]*SubscriptionState),
 	}
 
-	for subName := range schema.Subscriptions {
+	for subName := range config.Subscriptions {
 		err = server.RefreshSubscription(subName)
 		if err != nil {
 			log.Fatalf("Failed to start up: %v", err)
@@ -772,6 +931,13 @@ func main() {
 	}
 
 	http.HandleFunc("/ws", server.WebSocketEndpoint)
-	http.HandleFunc("/api", server.WebSocketEndpoint)
-	log.Fatal(http.ListenAndServe(config.Host, nil))
+	//http.HandleFunc("/api", server.PlainEndpoint)
+	if config.EnableTLS {
+		if config.CertFile == "" || config.KeyFile == "" {
+			log.Fatal("You must specify certFile and keyFile in the config")
+		}
+		log.Fatal(http.ListenAndServeTLS(config.Host, config.CertFile, config.KeyFile, nil))
+	} else {
+		log.Fatal(http.ListenAndServe(config.Host, nil))
+	}
 }
