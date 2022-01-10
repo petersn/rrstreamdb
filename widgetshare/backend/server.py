@@ -41,7 +41,7 @@ def do_work(code: str):
         pass
     with open("../src/index.tsx", "w") as f:
         f.write(code)
-    subprocess.Popen(["npm", "run", "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(["npm", "run", "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print("Launched subprocess:", proc.pid)
     timeout = False
     try:
