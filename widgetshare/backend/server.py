@@ -116,7 +116,7 @@ class CompileHandler(AllowCORS, tornado.web.RequestHandler):
 
 
 application = tornado.web.Application([
-    ("/api/compile", CompileHandler),
+    ("/widgets/compile", CompileHandler),
 ])
 
 if __name__ == "__main__":
