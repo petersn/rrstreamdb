@@ -24,7 +24,9 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-const version = "v0.0"
+const VERSION = "v0.0"
+const PING_PERIOD = 10 * time.Second
+const WRITE_WAIT = 5 * time.Second
 
 var debugMode = false
 
@@ -135,6 +137,7 @@ func WriteMessage(conn *websocket.Conn, message []byte) error {
 	if debugMode {
 		fmt.Printf("\x1b[92mSend[%p]:\x1b[0m %s\n", conn, message)
 	}
+	conn.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
 	return conn.WriteMessage(websocket.TextMessage, message)
 }
 
@@ -547,6 +550,8 @@ func (serv *Server) MakeClient(authToken []byte) (*ClientState, error) {
 		return nil, errors.New("expired claim")
 	}
 
+	log.Printf("connection: %s", authTokenParts[0])
+
 	clientState := &ClientState{
 		ValidityUntilUnix:  lastValidTimestamp,
 		WritePermissionBit: false,
@@ -575,7 +580,24 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		log.Print("upgrade:", err)
 		return
 	}
-	defer c.Close()
+	if debugMode {
+		fmt.Printf("\x1b[91mOpen[%p]\x1b[0m\n", c)
+	}
+	ticker := time.NewTicker(PING_PERIOD)
+	defer func() {
+		if debugMode {
+			fmt.Printf("\x1b[91mClose[%p]\x1b[0m\n", c)
+		}
+		c.Close()
+		ticker.Stop()
+	}()
+	c.SetPongHandler(func(x string) error {
+		if debugMode {
+			fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m pong\n", c)
+		}
+		c.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
+		return nil
+	})
 
 	// Read an initial auth message that must be equal to the secret password.
 	mt, message, err := c.ReadMessage()
@@ -586,18 +608,32 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	clientState, err := serv.MakeClient(message)
 	if err != nil {
-		err = WriteMessage(c, []byte(
-			fmt.Sprintf("{\"kind\": \"error\", \"message\": \"%s\"}", err),
-		))
+		bytes, err = json.Marshal(struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		}{
+			Kind:    "error",
+			Message: err.Error(),
+		})
+		if err != nil {
+			log.Println("marshal:", err)
+			return
+		}
+		err = WriteMessage(c, bytes)
 		if err != nil {
 			log.Println("write:", err)
-			return
 		}
 		return
 	}
 
 	err = WriteMessage(c, []byte("{\"kind\": \"auth\"}"))
+	if err != nil {
+		log.Println("write:", err)
+		return
+	}
 
+	// TODO: Think carefully about this channel size. At size 0 we deadlock.
+	// I think we might deadlock at any finite size in some situations.
 	wakeupChannel := make(chan WakeUpMessage, 128)
 	//LOCKMESSAGE("About to lock...")
 	serv.Mutex.Lock()
@@ -623,6 +659,10 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			}
 			if debugMode {
 				fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m %s\n", c, message)
+			}
+			if len(message) == 0 {
+				log.Println("\x1b[91mlength zero message?\x1b[0m")
+				break
 			}
 			messageChannel <- string(message)
 		}
@@ -688,10 +728,9 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					for k, v := range protocolRequest.Row {
 						singleRow[k] = []interface{}{v}
 					}
-					err = serv.AppendRows(protocolRequest.Table, DataRows{
+					if err = serv.AppendRows(protocolRequest.Table, DataRows{
 						Length: 1, Data: singleRow,
-					})
-					if err == nil {
+					}); err == nil {
 						goto good
 					}
 					errorMessage = fmt.Sprintf("invalid append: %s", err)
@@ -718,9 +757,10 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 						FilterCursors:    filterCursors,
 					}
 					err = serv.CatchUpCursor(c, protocolRequest.Token, &subCursor, true)
-					// FIXME: Properly handle err here
-					//goto good
-					continue
+					if err == nil {
+						continue
+					}
+					errorMessage = fmt.Sprintf("query failure: %s", err)
 				} else {
 					errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
 				}
@@ -732,9 +772,10 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 						FilterCursors:    filterCursors,
 					}
 					err = serv.CatchUpCursor(c, protocolRequest.Token, clientState.Cursors[protocolRequest.Token], true)
-					// FIXME: Properly handle err here
-					//goto good
-					continue
+					if err == nil {
+						continue
+					}
+					errorMessage = fmt.Sprintf("subscribe failure: %s", err)
 				} else {
 					errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
 				}
@@ -821,11 +862,24 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			//}
 
 			for token, subCursor := range clientState.Cursors {
-				err = serv.CatchUpCursor(c, token, subCursor, false)
-				// FIXME: TODO: Handle the error
+				if err = serv.CatchUpCursor(c, token, subCursor, false); err != nil {
+					log.Println("cursor:", err)
+					return
+				}
 			}
 			//log.Println("wake up for wakeup channel")
 			//c.WriteMessage()
+		case <-ticker.C:
+			if debugMode {
+				fmt.Printf("\x1b[92mSend[%p]:\x1b[0m ping\n", c)
+			}
+			c.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
+			if err = c.WriteMessage(websocket.TextMessage, []byte("{\"kind\": \"ping\"}")); err != nil {
+				return
+			}
+			//if err = c.WriteMessage(websocket.PingMessage, nil); err != nil {
+			//	return
+			//}
 		}
 	}
 }
