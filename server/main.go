@@ -874,7 +874,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("\x1b[92mSend[%p]:\x1b[0m ping\n", c)
 			}
 			c.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
-			if err = c.WriteMessage(websocket.TextMessage, []byte("{\"kind\": \"ping\"}")); err != nil {
+			if err = c.WriteMessage(websocket.PingMessage, []byte("{\"kind\": \"ping\"}")); err != nil {
 				return
 			}
 			//if err = c.WriteMessage(websocket.PingMessage, nil); err != nil {
