@@ -24,6 +24,13 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+/*
+TODO:
+[ ] Add SQL polling
+[ ] Make sure I'm appropriately locking everywhere
+[ ] Plain HTTP handler
+*/
+
 const VERSION = "v0.0"
 const PING_PERIOD = 30 * time.Second
 const WRITE_WAIT = 10 * time.Second
@@ -627,7 +634,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = WriteMessage(c, []byte("{\"kind\": \"auth\"}"))
+	err = WriteMessage(c, []byte(fmt.Sprintf("{\"kind\": \"auth\", \"version\": \"%s\"}", VERSION)))
 	if err != nil {
 		log.Println("write:", err)
 		return

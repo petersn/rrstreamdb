@@ -44,7 +44,10 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
   listeners = new Set<Query<unknown>>();
   debugLog: string[] = [];
   requestToken: number = 0;
-  callbackTable = new Map<number, (data: any, isConnected: boolean) => void>();
+  callbackTable = new Map<number, {
+    isOneShot: boolean;
+    callback: (data: any, isConnected: boolean) => void;
+  }>();
   schemaTables: {[key: string]: ISchemaTable} = {};
   schemaSubscriptions: {[key: string]: ISchemaSubscription} = {};
 
@@ -66,7 +69,7 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
       this.status = 'connected';
       if (this.socket !== null)
         this.socket.send(this.props.authToken);
-      this.sendMessage({ kind: "getSchema" }, (data: any) => {
+      this.sendMessage({ kind: "getSchema" }, true, (data: any) => {
         this.schemaTables = data.tables;
         this.schemaSubscriptions = data.subscriptions;
       });
@@ -109,21 +112,29 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
     }
   }
 
-  sendMessage(message: any, callback: (data: any, isConnected: boolean) => void): void {
+  sendMessage(message: any, isOneShot: boolean, callback: (data: any, isConnected: boolean) => void): number {
     this.requestToken++;
     //var resolve;
     //const promise = new Promise((cont) => { resolve = cont; });
-    this.callbackTable.set(this.requestToken, callback);
+    this.callbackTable.set(this.requestToken, { isOneShot, callback });
     this.sendRaw(JSON.stringify({
       ...message,
       token: this.requestToken,
     }));
+    return this.requestToken;
+  }
+
+  removeCallback(token: number) {
+    this.callbackTable.delete(token);
   }
 
   onMessage(payload: any): void {
     this.debug('Got: ' + JSON.stringify(payload));
     if (this.callbackTable.has(payload.token)) {
-      this.callbackTable.get(payload.token)!(payload, true);
+      const { isOneShot, callback } = this.callbackTable.get(payload.token)!;
+      callback(payload, true);
+      if (isOneShot)
+        this.callbackTable.delete(payload.token);
     }
     switch (payload.kind) {
       case 'error': {
@@ -151,6 +162,7 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
     return new Promise(
       (resolve) => this.sendMessage(
         { kind: 'appendBatch', table, rows: soaRows },
+        true,
         (data: any) => resolve(data),
       )
     );
@@ -192,6 +204,7 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
   isConnected = false;
   rows: any[] = [];
   rowsByGroup = new Map<any, any[]>();
+  token: number | null = null;
 
   constructor(props: IQueryProps<RowType>) {
     super(props);
@@ -205,7 +218,7 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
     }
     this.context.listeners.add(this);
     this.context.debug('Registering listener');
-    this.context.sendMessage(
+    this.token = this.context.sendMessage(
       {
         kind: this.props.subscribe ? 'subscribe' : 'query',
         subscription: this.props.query,
@@ -213,6 +226,7 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
         groups: this.props.groups?.map((value) => Array.isArray(value) ? value : [value, 0]),
         limit: this.props.limit,
       },
+      !this.props.subscribe,
       (data: any, isConnected: boolean) => {
         this.isConnected = isConnected;
         const sub = (this.context as StreamDBProvider).schemaSubscriptions[this.props.query];
@@ -252,6 +266,8 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
     if (this.context !== null) {
       this.context.listeners.delete(this);
       this.context.debug('Deregistering listener');
+      if (this.token !== null)
+        this.context.removeCallback(this.token);
     }
   }
 
@@ -267,9 +283,6 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
   }
 
   render() {
-    //if (this.context === null) {
-    //  
-    //}
     if (this.props.children === undefined)
       return null;
     return this.props.children(this.makeQueryResults());
