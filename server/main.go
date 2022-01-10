@@ -25,8 +25,8 @@ import (
 )
 
 const VERSION = "v0.0"
-const PING_PERIOD = 10 * time.Second
-const WRITE_WAIT = 5 * time.Second
+const PING_PERIOD = 30 * time.Second
+const WRITE_WAIT = 10 * time.Second
 
 var debugMode = false
 
@@ -592,14 +592,15 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		ticker.Stop()
 	}()
 	c.SetPongHandler(func(x string) error {
-		if debugMode {
-			fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m pong\n", c)
-		}
+		//if debugMode {
+		//	fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m pong\n", c)
+		//}
 		c.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
 		return nil
 	})
 
 	// Read an initial auth message that must be equal to the secret password.
+	c.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
 	mt, message, err := c.ReadMessage()
 	if err != nil || mt != websocket.TextMessage {
 		log.Print("bad auth message:", err)
@@ -709,7 +710,6 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				case string:
 					filterCursors[val] = cursorCell
 				}
-
 			}
 
 			switch protocolRequest.Kind {
@@ -870,16 +870,10 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			//log.Println("wake up for wakeup channel")
 			//c.WriteMessage()
 		case <-ticker.C:
-			if debugMode {
-				fmt.Printf("\x1b[92mSend[%p]:\x1b[0m ping\n", c)
-			}
 			c.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
-			if err = c.WriteMessage(websocket.PingMessage, []byte("{\"kind\": \"ping\"}")); err != nil {
+			if err = c.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
-			//if err = c.WriteMessage(websocket.PingMessage, nil); err != nil {
-			//	return
-			//}
 		}
 	}
 }
