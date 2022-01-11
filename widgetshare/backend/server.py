@@ -122,6 +122,8 @@ class CompileHandler(AllowCORS, tornado.web.RequestHandler):
             self.write(json.dumps({"done": False, "token": token}))
 
 
+# GitHub secret: a626713374dfbf1f
+
 class WebhookHandler(AllowCORS, tornado.web.RequestHandler):
     def post(self):
         print(repr(self.request.body))
