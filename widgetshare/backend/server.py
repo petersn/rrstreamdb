@@ -54,8 +54,11 @@ def do_work(code: str):
     print("Subprocess completed:", proc.pid)
     #with open("../dist/index.js") as f:
     #    compiled = f.read()
-    with open("../dist/main.js") as f:
-        bundled = f.read()
+    try:
+        with open("../dist/main.js") as f:
+            bundled = f.read()
+    except FileNotFoundError:
+        bundled = None
     return {
         "stdout": stdout.decode(errors="ignore"),
         "stderr": stderr.decode(errors="ignore"),
