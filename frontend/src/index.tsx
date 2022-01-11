@@ -89,33 +89,22 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
     this.socket.addEventListener('message', (event) => { 
       this.onMessage(JSON.parse(event.data));
     });
-
-    // Trigger all of our queries to requery.
-    for (const query of this.listeners) {
-      //this.send(query.props.query);
-    }
-  }
-
-  debug(message: string): void {
-    console.log('[DEBUG] ', message);
-    this.debugLog.push(message);
-    this.forceUpdate();
   }
 
   sendRaw(message: string): void {
     if (this.socket !== null && this.socket.readyState === WebSocket.OPEN) {
-      this.debug(message);
       this.socket.send(message)
     } else {
-      this.debug('queuing: ' + message);
       this.queuedMessages.push(message);
     }
   }
 
-  sendMessage(message: any, isOneShot: boolean, callback: (data: any, isConnected: boolean) => void): number {
+  sendMessage(
+    message: any,
+    isOneShot: boolean,
+    callback: (data: any, isConnected: boolean) => void,
+  ): number {
     this.requestToken++;
-    //var resolve;
-    //const promise = new Promise((cont) => { resolve = cont; });
     this.callbackTable.set(this.requestToken, { isOneShot, callback });
     this.sendRaw(JSON.stringify({
       ...message,
@@ -129,7 +118,6 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
   }
 
   onMessage(payload: any): void {
-    this.debug('Got: ' + JSON.stringify(payload));
     if (this.callbackTable.has(payload.token)) {
       const { isOneShot, callback } = this.callbackTable.get(payload.token)!;
       callback(payload, true);
@@ -139,13 +127,8 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
     switch (payload.kind) {
       case 'error': {
         this.status = 'error';
-        this.debug('Error ' + payload.message);
         break;
       }
-      //case 'data': {
-      //  
-      //  break;
-      //}
     }
   }
 
@@ -170,14 +153,6 @@ export class StreamDBProvider extends React.PureComponent<IStreamDBProps> {
 
   render() {
     return <StreamDBContext.Provider value={this}>
-      {/*this.debugLog.map((s, i) =>
-        <div style={{
-          border: '1px solid black',
-          borderRadius: 5,
-          backgroundColor: '#444',
-          padding: 4,
-          margin: 4,
-        }} id={i.toString()}>{s}</div>)*/}
       {this.props.children}
     </StreamDBContext.Provider>
   }

@@ -3,7 +3,6 @@ import json
 import time
 import hmac
 import hashlib
-import threading
 import asyncio
 import contextlib
 import argparse
@@ -53,13 +52,16 @@ class StreamDB:
             try:
                 message = json.loads(await self.ws.recv())
             except websockets.exceptions.ConnectionClosed:
+                print("\x1b[91mCLOSING CONNECTION!\x1b[0m")
                 break
+            print("\x1b[91mGOT MESSAGE:\x1b[0m", message)
             if "token" not in message:
                 print("WEIRD:", message)
             elif message["token"] in self.future_table:
                 fut = self.future_table.pop(message["token"])
                 if message["kind"] == "error":
                     fut.set_exception(StreamDBError(message["message"]))
+                    print("\x1b[91mSET EXCEPTION\x1b[0m")
                 else:
                     fut.set_result(message)
 
@@ -89,6 +91,7 @@ class StreamDB:
             "table": table,
             "row": row,
         })
+        print("\x1b[91mAWAITING\x1b[0m")
         return await fut
 
     async def append_batch(self, table: str, rows: Dict[str, List[Any]]):
