@@ -192,7 +192,7 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
       return;
     }
     this.context.listeners.add(this);
-    this.context.debug('Registering listener');
+    //this.context.debug('Registering listener');
     this.token = this.context.sendMessage(
       {
         kind: this.props.subscribe ? 'subscribe' : 'query',
@@ -240,7 +240,7 @@ export class Query<RowType> extends React.PureComponent<IQueryProps<RowType>> {
   componentWillUnmount(): void {
     if (this.context !== null) {
       this.context.listeners.delete(this);
-      this.context.debug('Deregistering listener');
+      //this.context.debug('Deregistering listener');
       if (this.token !== null)
         this.context.removeCallback(this.token);
     }
