@@ -131,7 +131,7 @@ class WebhookHandler(AllowCORS, tornado.web.RequestHandler):
 
 application = tornado.web.Application([
     ("/widgets/compile", CompileHandler),
-    ("/widgets/githubwebhook", WebhookHandler),
+    ("/webhooks/githubwebhook", WebhookHandler),
 ])
 
 if __name__ == "__main__":
