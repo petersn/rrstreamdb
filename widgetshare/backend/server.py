@@ -52,8 +52,8 @@ def do_work(code: str):
         stdout, stderr = proc.communicate()
         timeout = True
     print("Subprocess completed:", proc.pid)
-    with open("../dist/index.js") as f:
-        compiled = f.read()
+    #with open("../dist/index.js") as f:
+    #    compiled = f.read()
     with open("../dist/main.js") as f:
         bundled = f.read()
     return {
@@ -62,7 +62,7 @@ def do_work(code: str):
         "ret": proc.returncode,
         "elapsed": time.monotonic() - start_time,
         "timeout": timeout,
-        "compiled": compiled,
+        #"compiled": compiled,
         "bundled": bundled,
     }
 
