@@ -1,4 +1,5 @@
 import subprocess
+import shutil
 import time
 import json
 import datetime
@@ -36,7 +37,7 @@ def do_work(code: str):
     start_time = time.monotonic()
     #proc = subprocess.Popen(["python", "evaluate_loss.py", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        os.unlink("../dist/index.js")
+        shutil.rmtree("../dist/")
     except FileNotFoundError:
         pass
     with open("../src/index.tsx", "w") as f:
@@ -45,7 +46,7 @@ def do_work(code: str):
     print("Launched subprocess:", proc.pid)
     timeout = False
     try:
-        stdout, stderr = proc.communicate(timeout=30)
+        stdout, stderr = proc.communicate(timeout=60)
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
@@ -53,6 +54,8 @@ def do_work(code: str):
     print("Subprocess completed:", proc.pid)
     with open("../dist/index.js") as f:
         compiled = f.read()
+    with open("../dist/main.js") as f:
+        bundled = f.read()
     return {
         "stdout": stdout.decode(errors="ignore"),
         "stderr": stderr.decode(errors="ignore"),
@@ -60,6 +63,7 @@ def do_work(code: str):
         "elapsed": time.monotonic() - start_time,
         "timeout": timeout,
         "compiled": compiled,
+        "bundled": bundled,
     }
 
 
