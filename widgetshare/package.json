@@ -10,11 +10,13 @@
   "devDependencies": {
     "@rollup/plugin-commonjs": "^21.0.1",
     "@rollup/plugin-node-resolve": "^13.1.3",
+    "@rollup/plugin-replace": "^3.0.1",
     "@rollup/plugin-typescript": "^8.3.0",
     "@types/react": "^17.0.38",
     "@types/react-dom": "^17.0.11",
     "prettier": "^2.5.1",
     "rollup": "^2.63.0",
+    "rollup-plugin-terser": "^7.0.2",
     "ts-loader": "^9.2.6",
     "tslint": "^6.1.3",
     "tslint-config-prettier": "^1.18.0",
@@ -33,7 +35,7 @@
     "buildtsc": "tsc",
     "build": "webpack --mode production",
     "dev": "webpack --mode development",
-    "rollup": "rollup --config rollup.config.js"
+    "rollup": "rollup -c --environment INCLUDE_DEPS,BUILD:production"
   },
   "author": "Peter Schmidt-Nielsen <schmidtnielsenpeter@gmail.com>",
   "license": "CC0"
