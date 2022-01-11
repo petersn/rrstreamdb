@@ -122,8 +122,14 @@ class CompileHandler(AllowCORS, tornado.web.RequestHandler):
             self.write(json.dumps({"done": False, "token": token}))
 
 
+class WebhookHandler(AllowCORS, tornado.web.RequestHandler):
+    def post(self):
+        print(repr(self.request.body))
+
+
 application = tornado.web.Application([
     ("/widgets/compile", CompileHandler),
+    ("/widgets/githubwebhook", WebhookHandler),
 ])
 
 if __name__ == "__main__":
