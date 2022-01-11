@@ -42,7 +42,7 @@ def do_work(code: str):
         pass
     with open("../src/index.tsx", "w") as f:
         f.write(code)
-    proc = subprocess.Popen(["npm", "run", "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(["npm", "run", "rollup"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print("Launched subprocess:", proc.pid)
     timeout = False
     try:
@@ -55,7 +55,7 @@ def do_work(code: str):
     #with open("../dist/index.js") as f:
     #    compiled = f.read()
     try:
-        with open("../dist/main.js") as f:
+        with open("../dist/index.js") as f:
             bundled = f.read()
     except FileNotFoundError:
         bundled = None
