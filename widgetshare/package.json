@@ -26,7 +26,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "buildtsc": "tsc",
     "build": "webpack --mode production",
-    "dev": "webpack --mode development",
+    "dev": "webpack --mode development"
   },
   "author": "Peter Schmidt-Nielsen <schmidtnielsenpeter@gmail.com>",
   "license": "CC0"
