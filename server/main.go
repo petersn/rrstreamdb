@@ -169,12 +169,6 @@ func max(a, b int64) int64 {
 	return a
 }
 
-func LOCKMESSAGE(x string) {
-	//if debugMode {
-	//	fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
-	//}
-}
-
 func WriteMessage(conn *websocket.Conn, message []byte) error {
 	if debugMode {
 		fmt.Printf("\x1b[92mSend[%p]:\x1b[0m %s\n", conn, message)
@@ -257,9 +251,6 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	if debugMode && fullPrint {
 		fmt.Printf("\x1b[93mPulling table:\x1b[0m %s\n", pull.TableName)
 	}
-	//subSpec := serv.Config.Subscriptions[subName]
-	//subState := serv.Subscriptions[subName]
-
 	var query string
 	switch pull.PullKind {
 	// Select the most recent row
@@ -277,12 +268,8 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	}
 
 	// Read all of the corresponding rows
-	LOCKMESSAGE("RefreshPull - DatabaseMutex.Lock")
 	serv.DatabaseMutex.Lock()
-	defer func() {
-		LOCKMESSAGE("RefreshPull - DatabaseMutex.Unlock")
-		serv.DatabaseMutex.Unlock()
-	}()
+	defer serv.DatabaseMutex.Unlock()
 	rows, err := serv.Database.Query(query)
 	if err != nil {
 		log.Fatalf("could not execute query: %#v", err)
@@ -329,82 +316,6 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	pull.MostRecentId = max(pull.MostRecentId, dataRows.MostRecentId)
 
 	return serv.UpdateSubscriptions(pull.TableName, dataRows)
-
-	/*
-		groupByColumnIndex := -1
-		if pull.GroupByColumn != "" {
-			for i, columnName := range columns {
-				if columnName == pull.GroupByColumn {
-					groupByColumnIndex = i
-				}
-			}
-			if groupByColumnIndex == -1 {
-				return fmt.Errorf("Bad group by")
-			}
-		}
-
-		serv.Mutex.Lock()
-		defer serv.Mutex.Unlock()
-
-		rowCount := 0
-		for rows.Next() {
-			dump := make([]interface{}, len(columns))
-			dumpPtrs := make([]interface{}, len(columns))
-			for i := range dump {
-				dumpPtrs[i] = &dump[i]
-			}
-			err = rows.Scan(dumpPtrs...)
-			if err != nil {
-				log.Fatalf("could not scan query: %#v", err)
-				return err
-			}
-			// Populate our stash of rows
-			if subSpec.GroupByColumn == "" {
-				if subSpec.MostRecent {
-					for i, value := range dump {
-						subState.RegularRows.Data[columns[i]] = []interface{}{value}
-					}
-				} else {
-					for i, value := range dump {
-						subState.RegularRows.Data[columns[i]] = append(subState.RegularRows.Data[columns[i]], value)
-					}
-				}
-				subState.MostRecentId = max(subState.MostRecentId, subState.RegularRows.Recompute())
-			} else {
-				groupByValue := dump[groupByColumnIndex]
-				if _, ok := subState.GroupByRows[groupByValue]; !ok {
-					subState.GroupByRows[groupByValue] = &DataRows{
-						Length: 0,
-						Data:   make(map[string][]interface{}),
-					}
-				}
-				ourGroup := subState.GroupByRows[groupByValue]
-				if subSpec.MostRecent {
-					for i, value := range dump {
-						ourGroup.Data[columns[i]] = []interface{}{value}
-					}
-				} else {
-					for i, value := range dump {
-						ourGroup.Data[columns[i]] = append(ourGroup.Data[columns[i]], value)
-					}
-				}
-				subState.MostRecentId = max(subState.MostRecentId, ourGroup.Recompute())
-			}
-			rowCount++
-			if debugMode && fullPrint && ((rowCount < 10_000 && rowCount%1_000 == 0) ||
-				(rowCount < 100_000 && rowCount%10_000 == 0) || rowCount%100_000 == 0) {
-				fmt.Printf("    ... %v rows so far\n", rowCount)
-			}
-		}
-
-		//fmt.Printf("%#v\n", subState)
-
-		if rowCount > 0 {
-			for channel, _ := range serv.Clients {
-				channel <- WakeUpMessage{}
-			}
-		}
-	*/
 }
 
 func binarySearchForNewRecords(largestSeen int64, rowData *DataRows) int {
@@ -429,13 +340,9 @@ func (serv *Server) CatchUpCursor(
 	cursor *SubscriptionCursor,
 	sendEmpty bool,
 ) error {
-	//if debugMode {
-	//	fmt.Printf("\x1b[91mCatch up cursor\x1b[0m: %v\n", cursor)
-	//}
 	retrievedData := make(map[string][]interface{})
 	addRows := func(largestSeen int64, rowData *DataRows) {
 		newIndex := binarySearchForNewRecords(largestSeen, rowData)
-		//fmt.Printf("  \x1b[91mAdd rows\x1b[0m: largestSeen=%v newIndex=%v length=%v\n", largestSeen, newIndex, rowData.Length)
 		if newIndex < rowData.Length {
 			for fieldName, values := range rowData.Data {
 				retrievedData[fieldName] = append(retrievedData[fieldName], values[newIndex:]...)
@@ -445,26 +352,17 @@ func (serv *Server) CatchUpCursor(
 
 	// Lookup the subscription state
 	subState := serv.Subscriptions[cursor.SubscriptionName]
-	//pp.Print(serv.Subscriptions)
-	//fmt.Printf("Subscriptions: %#v\n", serv.Subscriptions)
-	//fmt.Printf("Got here: %v %#v\n%#v\n", token, cursor, subState)
 	if subState.SubscriptionSpec.GroupByColumn == "" {
 		addRows(cursor.Cursor, &subState.RegularRows)
 		cursor.Cursor = subState.RegularRows.MostRecentId
-		//fmt.Printf("\x1b[91mUpdating to: %v\x1b[0m\n", subState.RegularRows.MostRecentId)
 	} else {
 		for cursorFilterValue, largestSeen := range cursor.FilterCursors {
-			//fmt.Printf("Got here: %v %#v\n%#v\n", token, cursor, subState)
 			ourGroup, ok := subState.GroupByRows[cursorFilterValue]
 			if !ok {
-				//pp.Print("Bad results:", subState.GroupByRows, cursorFilterValue)
 				continue
 			}
 			addRows(*largestSeen, ourGroup)
 			*cursor.FilterCursors[cursorFilterValue] = ourGroup.MostRecentId
-			//if debugMode {
-			//	fmt.Printf("\x1b[91mUpdating to: %v\x1b[0m\n", ourGroup.MostRecentId)
-			//}
 		}
 	}
 
@@ -499,10 +397,6 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 	for key := range tableDesc.Fields {
 		columnNames = append(columnNames, key)
 	}
-
-	//if debugMode {
-	//	fmt.Printf("\x1b[96mAppend rows: %v\x1b[0m\n", rowData.Length)
-	//}
 
 	// We're immediately done if we have no rows.
 	if rowData.Length == 0 {
@@ -545,20 +439,11 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 		fmt.Fprint(&sb, ")")
 	}
 	fmt.Fprint(&sb, " RETURNING id, created_at")
-	//fmt.Println(sb.String())
-
-	//if debugMode {
-	//	fmt.Printf("\x1b[96mQuery formed\x1b[0m\n")
-	//}
 
 	ids := make([]interface{}, 0)
 	createdAts := make([]interface{}, 0)
-	LOCKMESSAGE("AppendRows - DatabaseMutex.Lock")
 	serv.DatabaseMutex.Lock()
-	defer func() {
-		LOCKMESSAGE("AppendRows - DatabaseMutex.Unlock")
-		serv.DatabaseMutex.Unlock()
-	}()
+	defer serv.DatabaseMutex.Unlock()
 	idTimestampRows, err := serv.Database.Query(sb.String(), values...)
 	if err != nil {
 		return err
@@ -580,34 +465,24 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 }
 
 func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) error {
-	// It is somewhat sublte that this logic here is even correct, because we could get duplicate rows into
+	// It is somewhat subtle that this logic here is even correct, because we could get duplicate rows into
 	// UpdateSubscriptions due to multiple pulls on the same table with differing group-by columns. However,
 	// if this occurs then we necessarily don't have any non-most-recent (a.k.a. all) subscriptions on this
 	// table, and therefore it's always safe to apply duplicate rows, so long as we ignore stale rows. Our
 	// one precondition is that rowData be sorted by id.
 
-	//if debugMode {
-	//	fmt.Printf("\x1b[96mUpdating subscriptions!\x1b[0m\n")
-	//}
 	if rowData.Length == 0 {
 		return nil
 	}
-	LOCKMESSAGE("UpdateSubscriptions - Mutex.Lock")
 	serv.Mutex.Lock()
-	LOCKMESSAGE("UpdateSubscriptions - Got lock!")
-	defer func() {
-		LOCKMESSAGE("UpdateSubscriptions - Mutex.Unlock")
-		serv.Mutex.Unlock()
-	}()
+	defer serv.Mutex.Unlock()
 
 	// First we update all relevant subscriptions.
 	for _, subState := range serv.Subscriptions {
-		LOCKMESSAGE(fmt.Sprintf("UpdateSubscriptions - Updating for: %s:%s", subState.SubscriptionSpec.TableName, subState.SubscriptionSpec.GroupByColumn))
 		subSpec := subState.SubscriptionSpec
 		if subSpec.TableName != tableName {
 			continue
 		}
-		LOCKMESSAGE(fmt.Sprintf("UpdateSubscriptions - Really updating for: %s:%s", subState.SubscriptionSpec.TableName, subState.SubscriptionSpec.GroupByColumn))
 		idsSlice := rowData.Data["id"]
 		if subSpec.GroupByColumn == "" {
 			id := idsSlice[len(idsSlice)-1].(int64)
@@ -630,7 +505,6 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 			groupByColumnSlice := rowData.Data[subSpec.GroupByColumn]
 			// Apply each row in turn, so we can split it out into the appropriate group
 			for i := 0; i < rowData.Length; i++ {
-				LOCKMESSAGE(fmt.Sprintf("UpdateSubscriptions - Iterating rows: %s:%s - %v", subState.SubscriptionSpec.TableName, subState.SubscriptionSpec.GroupByColumn, i))
 				groupByValue := groupByColumnSlice[i]
 				id := idsSlice[i].(int64)
 				if _, ok := subState.GroupByRows[groupByValue]; !ok {
@@ -659,16 +533,9 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 			}
 		}
 	}
-	LOCKMESSAGE("UpdateSubscriptions - Reached end of loop")
-
-	//pp.Print(serv.Subscriptions)
 
 	// Wake everyone up
 	// TODO: Properly only wake up folks waiting on these tables, or maybe even these groups.
-	//if debugMode {
-	//	fmt.Printf("\x1b[95mSending wake ups\x1b[0m\n")
-	//	pp.Print(serv.Clients)
-	//}
 	for channel, _ := range serv.Clients {
 		channel <- WakeUpMessage{}
 	}
@@ -788,9 +655,6 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		ticker.Stop()
 	}()
 	c.SetPongHandler(func(x string) error {
-		//if debugMode {
-		//	fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m pong\n", c)
-		//}
 		c.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
 		return nil
 	})
@@ -832,16 +696,12 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 	// TODO: Think carefully about this channel size. At size 0 we deadlock.
 	// I think we might deadlock at any finite size in some situations, but maybe 1 suffices?
 	wakeupChannel := make(chan WakeUpMessage, 128)
-	LOCKMESSAGE("About to lock...")
 	serv.Mutex.Lock()
-	LOCKMESSAGE("Got lock!")
 	serv.Clients[wakeupChannel] = clientState
 	serv.Mutex.Unlock()
 	defer func() {
-		LOCKMESSAGE("Locking")
 		serv.Mutex.Lock()
 		delete(serv.Clients, wakeupChannel)
-		LOCKMESSAGE("Unlocking")
 		serv.Mutex.Unlock()
 	}()
 
@@ -983,11 +843,6 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					errorMessage = "unknown subscription token"
 				}
 			case "getSchema":
-				//bytes, err := yaml.Marshal(serv.Config)
-				//if err != nil {
-				//	log.Println("yaml marshal:", err)
-				//	return
-				//}
 				bytes, err = json.Marshal(struct {
 					Kind          string      `json:"kind"`
 					Token         int64       `json:"token"`
@@ -1014,7 +869,6 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					errorMessage = "permission denied"
 				} else {
 					errorMessage = "not implemented yet"
-					//goto good
 				}
 			}
 
@@ -1047,24 +901,19 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				log.Println("write:", err)
 				return
 			}
+
 		case <-wakeupChannel:
 			if time.Now().Unix() > clientState.ValidityUntilUnix {
 				WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
 				return
 			}
-
-			//if debugMode {
-			//	fmt.Printf("\x1b[95mWake up: %p\x1b[0m\n", c)
-			//}
-
 			for token, subCursor := range clientState.Cursors {
 				if err = serv.CatchUpCursor(c, token, subCursor, false); err != nil {
 					log.Println("cursor:", err)
 					return
 				}
 			}
-			//log.Println("wake up for wakeup channel")
-			//c.WriteMessage()
+
 		case <-ticker.C:
 			c.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
 			if err = c.WriteMessage(websocket.PingMessage, nil); err != nil {
