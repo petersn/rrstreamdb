@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -44,6 +45,7 @@ const PING_PERIOD = 30 * time.Second
 const WRITE_WAIT = 10 * time.Second
 
 var debugMode = false
+var startUpTime = time.Now()
 
 var sqlTypeMapping = map[string]string{
 	"Text":            "TEXT NOT NULL",
@@ -160,6 +162,9 @@ type Server struct {
 	Clients       map[chan WakeUpMessage]*ClientState
 	Subscriptions map[string]*SubscriptionState
 	TablePulls    []*TablePull
+	RequestCount  int64
+	BytesSent     int64
+	BytesReceived int64
 }
 
 type ReplyFunction interface {
@@ -610,6 +615,9 @@ func (serv *Server) MakeClient(authToken []byte) (*ClientState, error) {
 }
 
 func (serv *Server) HandleMessage(reply ReplyFunction, clientState *ClientState, message string) error {
+	atomic.AddInt64(&serv.RequestCount, 1)
+	atomic.AddInt64(&serv.BytesReceived, int64(len(message)))
+
 	if time.Now().Unix() > clientState.ValidityUntilUnix {
 		reply.Write([]byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
 		return errors.New("auth expired")
@@ -721,6 +729,43 @@ func (serv *Server) HandleMessage(reply ReplyFunction, clientState *ClientState,
 		} else {
 			errorMessage = "unknown subscription token"
 		}
+	case "health":
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		serv.Mutex.Lock()
+		clientCount := len(serv.Clients)
+		serv.Mutex.Unlock()
+		bytes, err := json.Marshal(struct {
+			Kind          string  `json:"kind"`
+			Token         int64   `json:"token"`
+			Version       string  `json:"version"`
+			MemoryBytes   uint64  `json:"memoryBytes"`
+			Clients       int     `json:"clients"`
+			RequestCount  int64   `json:"requestCount"`
+			BytesSent     int64   `json:"bytesSent"`
+			BytesReceived int64   `json:"bytesReceived"`
+			UptimeSeconds float64 `json:"uptimeSeconds"`
+		}{
+			Kind:          "health",
+			Token:         protocolRequest.Token,
+			Version:       VERSION,
+			MemoryBytes:   m.Alloc,
+			Clients:       clientCount,
+			RequestCount:  serv.RequestCount,
+			BytesSent:     serv.BytesSent,
+			BytesReceived: serv.BytesReceived,
+			UptimeSeconds: time.Since(startUpTime).Seconds(),
+		})
+		if err != nil {
+			log.Println("json marshal:", err)
+			return errors.New("json marshal failed")
+		}
+		err = reply.Write(bytes)
+		if err != nil {
+			log.Println("write:", err)
+			return errors.New("write failed")
+		}
+		return nil
 	case "getSchema":
 		bytes, err := json.Marshal(struct {
 			Kind          string      `json:"kind"`
@@ -784,10 +829,12 @@ good:
 }
 
 type WebsocketReplyFunction struct {
+	Serv *Server
 	Conn *websocket.Conn
 }
 
 func (wsReplyFunc *WebsocketReplyFunction) Write(message []byte) error {
+	atomic.AddInt64(&wsReplyFunc.Serv.BytesSent, int64(len(message)))
 	return WriteMessage(wsReplyFunc.Conn, message)
 }
 
@@ -882,7 +929,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		close(messageChannel)
 	}()
 
-	connReplyFunction := WebsocketReplyFunction{Conn: conn}
+	connReplyFunction := WebsocketReplyFunction{Serv: serv, Conn: conn}
 
 	for {
 		select {
@@ -915,10 +962,12 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 type PlainReplyFunction struct {
+	Serv *Server
 	Dump []byte
 }
 
 func (plainReplyFunc *PlainReplyFunction) Write(message []byte) error {
+	atomic.AddInt64(&plainReplyFunc.Serv.BytesSent, int64(len(message)))
 	plainReplyFunc.Dump = message
 	return nil
 }
@@ -963,7 +1012,7 @@ func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plainReplyFunction := PlainReplyFunction{}
+	plainReplyFunction := PlainReplyFunction{Serv: serv}
 	if err = serv.HandleMessage(&plainReplyFunction, clientState, string(message)); err != nil {
 		log.Println("error handling:", err)
 	}
@@ -971,7 +1020,6 @@ func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	startUpTime := time.Now()
 	configPath := flag.String("config", "streamdb-config.yaml", "Config file to load")
 	makeAuthToken := flag.String("make-auth-token", "", "Make an auth token for a given claim")
 	applySchema := flag.Bool("apply-schema", false, "If true we create any required tables")
