@@ -32,7 +32,7 @@ TODO:
 [ ] Make sure I'm appropriately locking everywhere
 [ ] Plain HTTP handler
 [ ] Add listen/unlisten commands that just stream new rows
-[ ] Deduplicate what gets loaded between subscriptions to the same table
+[*] Deduplicate what gets loaded between subscriptions to the same table
 [ ] Make wakeup smarter (only wake up appropriate listeners)
 [ ] Implement binary search properly
 [ ] Implement "limit" requests properly
@@ -66,7 +66,7 @@ type DataRows struct {
 	MostRecentId int64
 }
 
-func (dr *DataRows) Recompute() int64 {
+func (dr *DataRows) Recompute() {
 	dr.Length = 0
 	for _, slice := range dr.Data {
 		dr.Length = len(slice)
@@ -76,7 +76,6 @@ func (dr *DataRows) Recompute() int64 {
 	if ids, ok := dr.Data["id"]; ok {
 		dr.MostRecentId = ids[len(ids)-1].(int64)
 	}
-	return dr.MostRecentId
 }
 
 type ServerConfig struct {
@@ -127,7 +126,20 @@ type SubscriptionState struct {
 	SubscriptionSpec SubscriptionSpec
 	GroupByRows      map[interface{}]*DataRows
 	RegularRows      DataRows
-	MostRecentId     int64
+}
+
+const (
+	PullJustNewest int64 = iota
+	PullNewestByGroup
+	PullAll
+)
+
+type TablePull struct {
+	TableName     string
+	PullKind      int64
+	GroupByColumn string
+	MostRecentId  int64
+	DebugName     string
 }
 
 type ClientState struct {
@@ -147,6 +159,7 @@ type Server struct {
 	Mutex         sync.RWMutex
 	Clients       map[chan WakeUpMessage]*ClientState
 	Subscriptions map[string]*SubscriptionState
+	TablePulls    []*TablePull
 }
 
 func max(a, b int64) int64 {
@@ -168,48 +181,97 @@ func WriteMessage(conn *websocket.Conn, message []byte) error {
 	return conn.WriteMessage(websocket.TextMessage, message)
 }
 
-func (serv *Server) InitializeSubscription(subName string) {
-	subSpec := serv.Config.Subscriptions[subName]
-	subState := &SubscriptionState{SubscriptionSpec: subSpec, MostRecentId: -1}
-	if subSpec.GroupByColumn == "" {
-		subState.RegularRows = DataRows{
-			Length: 0,
-			Data:   make(map[string][]interface{}),
+func (serv *Server) InitializeSubscriptions() {
+	highestPullNeededByTable := make(map[string]int64)
+	groupByColumnsByTable := make(map[string]map[string]struct{})
+
+	for subName, subSpec := range serv.Config.Subscriptions {
+		// Initialize the subscription state
+		subState := &SubscriptionState{SubscriptionSpec: subSpec}
+		if subSpec.GroupByColumn == "" {
+			subState.RegularRows = DataRows{
+				Length: 0,
+				Data:   make(map[string][]interface{}),
+			}
+		} else {
+			subState.GroupByRows = make(map[interface{}]*DataRows)
 		}
-	} else {
-		subState.GroupByRows = make(map[interface{}]*DataRows)
+		serv.Subscriptions[subName] = subState
+
+		columns, ok := groupByColumnsByTable[subSpec.TableName]
+		if !ok {
+			columns = make(map[string]struct{})
+			groupByColumnsByTable[subSpec.TableName] = columns
+		}
+
+		if !subSpec.MostRecent {
+			// If we want all records (grouped or not) then we must pull all records
+			highestPullNeededByTable[subSpec.TableName] = PullAll
+		} else if subSpec.GroupByColumn != "" {
+			// If we want the most recent within each group then we need to pull at least those,
+			// and we can't get away with only pulling the most recent record overall
+			highestPullNeededByTable[subSpec.TableName] = max(highestPullNeededByTable[subSpec.TableName], PullNewestByGroup)
+			columns[subSpec.GroupByColumn] = struct{}{}
+		}
 	}
-	serv.Subscriptions[subName] = subState
+
+	// Create table pulls
+	fmt.Printf("\x1b[93mPulling plan:\x1b[0m\n")
+	for tableName, pullKind := range highestPullNeededByTable {
+		// If we need to pull the newest by group, then we need to create one table pull for each group by column
+		if pullKind == PullNewestByGroup {
+			for columnName := range groupByColumnsByTable[tableName] {
+				serv.TablePulls = append(serv.TablePulls, &TablePull{
+					TableName:     tableName,
+					PullKind:      pullKind,
+					GroupByColumn: columnName,
+					MostRecentId:  -1,
+					DebugName:     tableName + ":" + columnName,
+				})
+				if debugMode {
+					fmt.Printf("\x1b[93m    ... pull each newest row from %s grouped by %s\x1b[0m\n", tableName, columnName)
+				}
+			}
+		} else {
+			serv.TablePulls = append(serv.TablePulls, &TablePull{
+				TableName:    tableName,
+				PullKind:     pullKind,
+				MostRecentId: -1,
+				DebugName:    tableName,
+			})
+			if debugMode {
+				if pullKind == PullJustNewest {
+					fmt.Printf("\x1b[93m    ... pull just the newest row from %s\x1b[0m\n", tableName)
+				} else {
+					fmt.Printf("\x1b[93m    ... pull all rows from %s\x1b[0m\n", tableName)
+				}
+			}
+		}
+	}
 }
 
-func (serv *Server) RefreshSubscription(subName string, fullPrint bool) error {
+func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	startTime := time.Now()
 	if debugMode && fullPrint {
-		fmt.Printf("\x1b[93mRefreshing subscription:\x1b[0m %s\n", subName)
+		fmt.Printf("\x1b[93mPulling table:\x1b[0m %s\n", pull.TableName)
 	}
-	subSpec := serv.Config.Subscriptions[subName]
-	subState := serv.Subscriptions[subName]
+	//subSpec := serv.Config.Subscriptions[subName]
+	//subState := serv.Subscriptions[subName]
 
 	var query string
-	switch true {
-	// Select all rows
-	case subSpec.GroupByColumn == "" && !subSpec.MostRecent:
-		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id", subSpec.TableName, subState.MostRecentId)
-
+	switch pull.PullKind {
 	// Select the most recent row
-	case subSpec.GroupByColumn == "" && subSpec.MostRecent:
-		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id DESC LIMIT 1", subSpec.TableName, subState.MostRecentId)
-
-	// Select all rows
-	case subSpec.GroupByColumn != "" && !subSpec.MostRecent:
-		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id", subSpec.TableName, subState.MostRecentId)
-
+	case PullJustNewest:
+		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id DESC LIMIT 1", pull.TableName, pull.MostRecentId)
 	// Select just the most recent row of each group
-	case subSpec.GroupByColumn != "" && subSpec.MostRecent:
+	case PullNewestByGroup:
 		query = fmt.Sprintf(
-			"SELECT * FROM %s WHERE id > %v AND id IN (SELECT MAX(id) FROM %s GROUP BY %s)",
-			subSpec.TableName, subState.MostRecentId, subSpec.TableName, subSpec.GroupByColumn,
+			"SELECT * FROM %s WHERE id > %v AND id IN (SELECT MAX(id) FROM %s GROUP BY %s) ORDER BY id",
+			pull.TableName, pull.MostRecentId, pull.TableName, pull.GroupByColumn,
 		)
+	// Select all rows
+	case PullAll:
+		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id", pull.TableName, pull.MostRecentId)
 	}
 
 	// Read all of the corresponding rows
@@ -226,20 +288,10 @@ func (serv *Server) RefreshSubscription(subName string, fullPrint bool) error {
 		return err
 	}
 
-	groupByColumnIndex := -1
-	if subSpec.GroupByColumn != "" {
-		for i, columnName := range columns {
-			if columnName == subSpec.GroupByColumn {
-				groupByColumnIndex = i
-			}
-		}
-		if groupByColumnIndex == -1 {
-			return fmt.Errorf("Bad group by")
-		}
+	dataRows := DataRows{
+		Length: 0,
+		Data:   make(map[string][]interface{}),
 	}
-
-	serv.Mutex.Lock()
-	defer serv.Mutex.Unlock()
 
 	rowCount := 0
 	for rows.Next() {
@@ -253,37 +305,8 @@ func (serv *Server) RefreshSubscription(subName string, fullPrint bool) error {
 			log.Fatalf("could not scan query: %#v", err)
 			return err
 		}
-		// Populate our stash of rows
-		if subSpec.GroupByColumn == "" {
-			if subSpec.MostRecent {
-				for i, value := range dump {
-					subState.RegularRows.Data[columns[i]] = []interface{}{value}
-				}
-			} else {
-				for i, value := range dump {
-					subState.RegularRows.Data[columns[i]] = append(subState.RegularRows.Data[columns[i]], value)
-				}
-			}
-			subState.MostRecentId = max(subState.MostRecentId, subState.RegularRows.Recompute())
-		} else {
-			groupByValue := dump[groupByColumnIndex]
-			if _, ok := subState.GroupByRows[groupByValue]; !ok {
-				subState.GroupByRows[groupByValue] = &DataRows{
-					Length: 0,
-					Data:   make(map[string][]interface{}),
-				}
-			}
-			ourGroup := subState.GroupByRows[groupByValue]
-			if subSpec.MostRecent {
-				for i, value := range dump {
-					ourGroup.Data[columns[i]] = []interface{}{value}
-				}
-			} else {
-				for i, value := range dump {
-					ourGroup.Data[columns[i]] = append(ourGroup.Data[columns[i]], value)
-				}
-			}
-			subState.MostRecentId = max(subState.MostRecentId, ourGroup.Recompute())
+		for i, value := range dump {
+			dataRows.Data[columns[i]] = append(dataRows.Data[columns[i]], value)
 		}
 		rowCount++
 		if debugMode && fullPrint && ((rowCount < 10_000 && rowCount%1_000 == 0) ||
@@ -293,17 +316,89 @@ func (serv *Server) RefreshSubscription(subName string, fullPrint bool) error {
 	}
 
 	if debugMode && (fullPrint || rowCount > 0) {
-		fmt.Printf("\x1b[93mRefreshed:\x1b[0m %s - %v rows - took %.3v seconds\n", subName, rowCount, time.Since(startTime).Seconds())
+		fmt.Printf("\x1b[93mRefreshed:\x1b[0m %s - %v rows - took %.3f seconds\n", pull.DebugName, rowCount, time.Since(startTime).Seconds())
 	}
-	//fmt.Printf("%#v\n", subState)
 
-	if rowCount > 0 {
-		for channel, _ := range serv.Clients {
-			channel <- WakeUpMessage{}
+	dataRows.Recompute()
+	pull.MostRecentId = max(pull.MostRecentId, dataRows.MostRecentId)
+
+	return serv.UpdateSubscriptions(pull.TableName, dataRows)
+
+	/*
+		groupByColumnIndex := -1
+		if pull.GroupByColumn != "" {
+			for i, columnName := range columns {
+				if columnName == pull.GroupByColumn {
+					groupByColumnIndex = i
+				}
+			}
+			if groupByColumnIndex == -1 {
+				return fmt.Errorf("Bad group by")
+			}
 		}
-	}
 
-	return nil
+		serv.Mutex.Lock()
+		defer serv.Mutex.Unlock()
+
+		rowCount := 0
+		for rows.Next() {
+			dump := make([]interface{}, len(columns))
+			dumpPtrs := make([]interface{}, len(columns))
+			for i := range dump {
+				dumpPtrs[i] = &dump[i]
+			}
+			err = rows.Scan(dumpPtrs...)
+			if err != nil {
+				log.Fatalf("could not scan query: %#v", err)
+				return err
+			}
+			// Populate our stash of rows
+			if subSpec.GroupByColumn == "" {
+				if subSpec.MostRecent {
+					for i, value := range dump {
+						subState.RegularRows.Data[columns[i]] = []interface{}{value}
+					}
+				} else {
+					for i, value := range dump {
+						subState.RegularRows.Data[columns[i]] = append(subState.RegularRows.Data[columns[i]], value)
+					}
+				}
+				subState.MostRecentId = max(subState.MostRecentId, subState.RegularRows.Recompute())
+			} else {
+				groupByValue := dump[groupByColumnIndex]
+				if _, ok := subState.GroupByRows[groupByValue]; !ok {
+					subState.GroupByRows[groupByValue] = &DataRows{
+						Length: 0,
+						Data:   make(map[string][]interface{}),
+					}
+				}
+				ourGroup := subState.GroupByRows[groupByValue]
+				if subSpec.MostRecent {
+					for i, value := range dump {
+						ourGroup.Data[columns[i]] = []interface{}{value}
+					}
+				} else {
+					for i, value := range dump {
+						ourGroup.Data[columns[i]] = append(ourGroup.Data[columns[i]], value)
+					}
+				}
+				subState.MostRecentId = max(subState.MostRecentId, ourGroup.Recompute())
+			}
+			rowCount++
+			if debugMode && fullPrint && ((rowCount < 10_000 && rowCount%1_000 == 0) ||
+				(rowCount < 100_000 && rowCount%10_000 == 0) || rowCount%100_000 == 0) {
+				fmt.Printf("    ... %v rows so far\n", rowCount)
+			}
+		}
+
+		//fmt.Printf("%#v\n", subState)
+
+		if rowCount > 0 {
+			for channel, _ := range serv.Clients {
+				channel <- WakeUpMessage{}
+			}
+		}
+	*/
 }
 
 func binarySearchForNewRecords(largestSeen int64, rowData *DataRows) int {
@@ -474,6 +569,12 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 }
 
 func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) error {
+	// It is somewhat sublte that this logic here is even correct, because we could get duplicate rows into
+	// UpdateSubscriptions due to multiple pulls on the same table with differing group-by columns. However,
+	// if this occurs then we necessarily don't have any non-most-recent (a.k.a. all) subscriptions on this
+	// table, and therefore it's always safe to apply duplicate rows, so long as we ignore stale rows. Our
+	// one precondition is that rowData be sorted by id.
+
 	//if debugMode {
 	//	fmt.Printf("\x1b[96mUpdating subscriptions!\x1b[0m\n")
 	//}
@@ -493,21 +594,33 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 		if subSpec.TableName != tableName {
 			continue
 		}
+		idsSlice := rowData.Data["id"]
 		if subSpec.GroupByColumn == "" {
+			id := idsSlice[len(idsSlice)-1].(int64)
+			// We *must* ignore stale rows! See the block comment at the top of this function for an explanation.
+			if subSpec.MostRecent && id <= subState.RegularRows.MostRecentId {
+				continue
+			}
+
 			for columnName, values := range rowData.Data {
 				if subSpec.MostRecent {
 					// If we want a single ungrouped most recent record then just immediately replace.
-					subState.RegularRows.Data[columnName] = []interface{}{values[len(values)-1]}
+					if id >= subState.RegularRows.MostRecentId {
+						subState.RegularRows.Data[columnName] = []interface{}{values[len(values)-1]}
+
+					}
 				} else {
 					// If we want all records ungrouped, then add all records.
 					subState.RegularRows.Data[columnName] = append(subState.RegularRows.Data[columnName], values...)
 				}
 			}
-			subState.MostRecentId = max(subState.MostRecentId, subState.RegularRows.Recompute())
+			subState.RegularRows.Recompute()
 		} else {
 			groupByColumnSlice := rowData.Data[subSpec.GroupByColumn]
+			// Apply each row in turn, so we can split it out into the appropriate group
 			for i := 0; i < rowData.Length; i++ {
 				groupByValue := groupByColumnSlice[i]
+				id := idsSlice[i].(int64)
 				if _, ok := subState.GroupByRows[groupByValue]; !ok {
 					subState.GroupByRows[groupByValue] = &DataRows{
 						Length: 0,
@@ -515,6 +628,11 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 					}
 				}
 				ourGroup := subState.GroupByRows[groupByValue]
+				// We *must* ignore stale rows! See the block comment at the top of this function for an explanation.
+				if subSpec.MostRecent && id <= ourGroup.MostRecentId {
+					continue
+				}
+
 				for columnName, values := range rowData.Data {
 					if subSpec.MostRecent {
 						// If we want a single ungrouped most recent record then just immediately replace.
@@ -524,7 +642,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 						ourGroup.Data[columnName] = append(ourGroup.Data[columnName], values...)
 					}
 				}
-				subState.MostRecentId = max(subState.MostRecentId, ourGroup.Recompute())
+				ourGroup.Recompute()
 			}
 		}
 	}
@@ -698,7 +816,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TODO: Think carefully about this channel size. At size 0 we deadlock.
-	// I think we might deadlock at any finite size in some situations.
+	// I think we might deadlock at any finite size in some situations, but maybe 1 suffices?
 	wakeupChannel := make(chan WakeUpMessage, 128)
 	//LOCKMESSAGE("About to lock...")
 	serv.Mutex.Lock()
@@ -1043,9 +1161,10 @@ func main() {
 		Subscriptions: make(map[string]*SubscriptionState),
 	}
 
-	for subName := range config.Subscriptions {
-		server.InitializeSubscription(subName)
-		err = server.RefreshSubscription(subName, true)
+	server.InitializeSubscriptions()
+
+	for _, pull := range server.TablePulls {
+		err = server.RefreshPull(pull, true)
 		if err != nil {
 			log.Fatalf("Failed to start up: %v", err)
 		}
@@ -1054,7 +1173,7 @@ func main() {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		fmt.Printf(
-			"All %v subscriptions refreshed - %v MiB allocated - %.3v seconds to start up\n",
+			"All %v subscriptions refreshed - %v MiB allocated - %.3f seconds to start up\n",
 			len(config.Subscriptions), m.Alloc/1024/1024, time.Since(startUpTime).Seconds(),
 		)
 	}
@@ -1064,10 +1183,10 @@ func main() {
 		go func() {
 			for {
 				time.Sleep(time.Microsecond * time.Duration(1e6*config.SQLPollingInterval))
-				for subName := range config.Subscriptions {
-					err = server.RefreshSubscription(subName, fullPrint)
+				for _, pull := range server.TablePulls {
+					err = server.RefreshPull(pull, fullPrint)
 					if err != nil {
-						log.Printf("\x1b[91mFailed to refresh subscription %s:\x1b[0m %v", subName, err)
+						log.Printf("\x1b[91mFailed to pull %s:\x1b[0m %v", pull.DebugName, err)
 					}
 				}
 				fullPrint = false
