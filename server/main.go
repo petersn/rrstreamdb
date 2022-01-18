@@ -170,7 +170,9 @@ func max(a, b int64) int64 {
 }
 
 func LOCKMESSAGE(x string) {
-	fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
+	if debugMode {
+		fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
+	}
 }
 
 func WriteMessage(conn *websocket.Conn, message []byte) error {
@@ -275,8 +277,12 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	}
 
 	// Read all of the corresponding rows
+	LOCKMESSAGE("RefreshPull - DatabaseMutex.Lock")
 	serv.DatabaseMutex.Lock()
-	defer serv.DatabaseMutex.Unlock()
+	defer func() {
+		LOCKMESSAGE("RefreshPull - DatabaseMutex.Unlock")
+		serv.DatabaseMutex.Unlock()
+	}()
 	rows, err := serv.Database.Query(query)
 	if err != nil {
 		log.Fatalf("could not execute query: %#v", err)
@@ -546,8 +552,12 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 
 	ids := make([]interface{}, 0)
 	createdAts := make([]interface{}, 0)
+	LOCKMESSAGE("AppendRows - DatabaseMutex.Lock")
 	serv.DatabaseMutex.Lock()
-	defer serv.DatabaseMutex.Unlock()
+	defer func() {
+		LOCKMESSAGE("AppendRows - DatabaseMutex.Unlock")
+		serv.DatabaseMutex.Unlock()
+	}()
 	idTimestampRows, err := serv.Database.Query(sb.String(), values...)
 	if err != nil {
 		return err
@@ -581,10 +591,10 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	if rowData.Length == 0 {
 		return nil
 	}
-	//LOCKMESSAGE("RLOCK")
+	LOCKMESSAGE("UpdateSubscriptions - Mutex.Lock")
 	serv.Mutex.Lock()
 	defer func() {
-		//LOCKMESSAGE("RUnLOCK")
+		LOCKMESSAGE("UpdateSubscriptions - Mutex.Unlock")
 		serv.Mutex.Unlock()
 	}()
 
