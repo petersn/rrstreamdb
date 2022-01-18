@@ -170,9 +170,9 @@ func max(a, b int64) int64 {
 }
 
 func LOCKMESSAGE(x string) {
-	if debugMode {
-		fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
-	}
+	//if debugMode {
+	//	fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
+	//}
 }
 
 func WriteMessage(conn *websocket.Conn, message []byte) error {
@@ -490,6 +490,7 @@ func (serv *Server) CatchUpCursor(
 }
 
 func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
+	rowData.Recompute()
 	tableDesc, ok := serv.Config.Tables[tableName]
 	if !ok {
 		return fmt.Errorf("unknown table for append: %#v", tableName)
@@ -618,10 +619,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 			for columnName, values := range rowData.Data {
 				if subSpec.MostRecent {
 					// If we want a single ungrouped most recent record then just immediately replace.
-					if id >= subState.RegularRows.MostRecentId {
-						subState.RegularRows.Data[columnName] = []interface{}{values[len(values)-1]}
-
-					}
+					subState.RegularRows.Data[columnName] = []interface{}{values[len(values)-1]}
 				} else {
 					// If we want all records ungrouped, then add all records.
 					subState.RegularRows.Data[columnName] = append(subState.RegularRows.Data[columnName], values...)
@@ -637,8 +635,9 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 				id := idsSlice[i].(int64)
 				if _, ok := subState.GroupByRows[groupByValue]; !ok {
 					subState.GroupByRows[groupByValue] = &DataRows{
-						Length: 0,
-						Data:   make(map[string][]interface{}),
+						Length:       0,
+						Data:         make(map[string][]interface{}),
+						MostRecentId: -1,
 					}
 				}
 				ourGroup := subState.GroupByRows[groupByValue]
@@ -650,10 +649,10 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 				for columnName, values := range rowData.Data {
 					if subSpec.MostRecent {
 						// If we want a single ungrouped most recent record then just immediately replace.
-						ourGroup.Data[columnName] = []interface{}{values[len(values)-1]}
+						ourGroup.Data[columnName] = []interface{}{values[i]}
 					} else {
-						// If we want all records ungrouped, then add all records.
-						ourGroup.Data[columnName] = append(ourGroup.Data[columnName], values...)
+						// If we want all records grouped, then add this record to the group
+						ourGroup.Data[columnName] = append(ourGroup.Data[columnName], values[i])
 					}
 				}
 				ourGroup.Recompute()
@@ -930,9 +929,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					for k, v := range protocolRequest.Row {
 						singleRow[k] = []interface{}{v}
 					}
-					if err = serv.AppendRows(protocolRequest.Table, DataRows{
-						Length: 1, Data: singleRow,
-					}); err == nil {
+					if err = serv.AppendRows(protocolRequest.Table, DataRows{Data: singleRow}); err == nil {
 						goto good
 					}
 					errorMessage = fmt.Sprintf("invalid append: %s", err)
@@ -941,12 +938,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				if !clientState.WritePermissionBit || serv.Config.ReadOnly {
 					errorMessage = "permission denied"
 				} else {
-					rowData := DataRows{
-						Data: protocolRequest.Rows,
-					}
-					rowData.Recompute()
-					err = serv.AppendRows(protocolRequest.Table, rowData)
-					if err == nil {
+					if err = serv.AppendRows(protocolRequest.Table, DataRows{Data: protocolRequest.Rows}); err == nil {
 						goto good
 					}
 					errorMessage = fmt.Sprintf("invalid appendBatch: %s", err)
