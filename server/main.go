@@ -28,9 +28,15 @@ import (
 
 /*
 TODO:
-[ ] Add SQL polling
+[*] Add SQL polling
 [ ] Make sure I'm appropriately locking everywhere
 [ ] Plain HTTP handler
+[ ] Add listen/unlisten commands that just stream new rows
+[ ] Deduplicate what gets loaded between subscriptions to the same table
+[ ] Make wakeup smarter (only wake up appropriate listeners)
+[ ] Implement binary search properly
+[ ] Implement "limit" requests properly
+[ ] Possibly implement a database -> config scraper
 */
 
 const VERSION = "v0.1"
@@ -60,7 +66,7 @@ type DataRows struct {
 	MostRecentId int64
 }
 
-func (dr *DataRows) Recompute() {
+func (dr *DataRows) Recompute() int64 {
 	dr.Length = 0
 	for _, slice := range dr.Data {
 		dr.Length = len(slice)
@@ -70,16 +76,19 @@ func (dr *DataRows) Recompute() {
 	if ids, ok := dr.Data["id"]; ok {
 		dr.MostRecentId = ids[len(ids)-1].(int64)
 	}
+	return dr.MostRecentId
 }
 
 type ServerConfig struct {
-	PostgresUrl string `yaml:"postgresUrl"`
-	Host        string `yaml:"host"`
-	HmacSecret  string `yaml:"hmacSecret"`
-	CertFile    string `yaml:"certFile"`
-	KeyFile     string `yaml:"keyFile"`
-	EnableTLS   bool   `yaml:"enableTLS"`
-	DebugMode   bool   `yaml:"debugMode"`
+	PostgresUrl        string  `yaml:"postgresUrl"`
+	Host               string  `yaml:"host"`
+	HmacSecret         string  `yaml:"hmacSecret"`
+	CertFile           string  `yaml:"certFile"`
+	KeyFile            string  `yaml:"keyFile"`
+	EnableTLS          bool    `yaml:"enableTLS"`
+	DebugMode          bool    `yaml:"debugMode"`
+	ReadOnly           bool    `yaml:"readOnly"`
+	SQLPollingInterval float64 `yaml:"sqlPollingInterval"`
 
 	// Schema part
 	Tables map[string]struct {
@@ -118,6 +127,7 @@ type SubscriptionState struct {
 	SubscriptionSpec SubscriptionSpec
 	GroupByRows      map[interface{}]*DataRows
 	RegularRows      DataRows
+	MostRecentId     int64
 }
 
 type ClientState struct {
@@ -139,6 +149,13 @@ type Server struct {
 	Subscriptions map[string]*SubscriptionState
 }
 
+func max(a, b int64) int64 {
+	if a < b {
+		return b
+	}
+	return a
+}
+
 func LOCKMESSAGE(x string) {
 	fmt.Printf("\x1b[95m%s\x1b[0m\n", x)
 }
@@ -151,13 +168,9 @@ func WriteMessage(conn *websocket.Conn, message []byte) error {
 	return conn.WriteMessage(websocket.TextMessage, message)
 }
 
-func (serv *Server) RefreshSubscription(subName string) error {
-	startTime := time.Now()
-	if debugMode {
-		fmt.Printf("\x1b[93mRefreshing subscription:\x1b[0m %s\n", subName)
-	}
+func (serv *Server) InitializeSubscription(subName string) {
 	subSpec := serv.Config.Subscriptions[subName]
-	subState := SubscriptionState{SubscriptionSpec: subSpec}
+	subState := &SubscriptionState{SubscriptionSpec: subSpec, MostRecentId: -1}
 	if subSpec.GroupByColumn == "" {
 		subState.RegularRows = DataRows{
 			Length: 0,
@@ -166,26 +179,36 @@ func (serv *Server) RefreshSubscription(subName string) error {
 	} else {
 		subState.GroupByRows = make(map[interface{}]*DataRows)
 	}
+	serv.Subscriptions[subName] = subState
+}
+
+func (serv *Server) RefreshSubscription(subName string, fullPrint bool) error {
+	startTime := time.Now()
+	if debugMode && fullPrint {
+		fmt.Printf("\x1b[93mRefreshing subscription:\x1b[0m %s\n", subName)
+	}
+	subSpec := serv.Config.Subscriptions[subName]
+	subState := serv.Subscriptions[subName]
 
 	var query string
 	switch true {
 	// Select all rows
 	case subSpec.GroupByColumn == "" && !subSpec.MostRecent:
-		query = fmt.Sprintf("SELECT * FROM %s ORDER BY id", subSpec.TableName)
+		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id", subSpec.TableName, subState.MostRecentId)
 
 	// Select the most recent row
 	case subSpec.GroupByColumn == "" && subSpec.MostRecent:
-		query = fmt.Sprintf("SELECT * FROM %s ORDER BY id DESC LIMIT 1", subSpec.TableName)
+		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id DESC LIMIT 1", subSpec.TableName, subState.MostRecentId)
 
 	// Select all rows
 	case subSpec.GroupByColumn != "" && !subSpec.MostRecent:
-		query = fmt.Sprintf("SELECT * FROM %s ORDER BY id", subSpec.TableName)
+		query = fmt.Sprintf("SELECT * FROM %s WHERE id > %v ORDER BY id", subSpec.TableName, subState.MostRecentId)
 
 	// Select just the most recent row of each group
 	case subSpec.GroupByColumn != "" && subSpec.MostRecent:
 		query = fmt.Sprintf(
-			"SELECT * FROM %s WHERE id IN (SELECT MAX(id) FROM %s GROUP BY %s)",
-			subSpec.TableName, subSpec.TableName, subSpec.GroupByColumn,
+			"SELECT * FROM %s WHERE id > %v AND id IN (SELECT MAX(id) FROM %s GROUP BY %s)",
+			subSpec.TableName, subState.MostRecentId, subSpec.TableName, subSpec.GroupByColumn,
 		)
 	}
 
@@ -215,6 +238,9 @@ func (serv *Server) RefreshSubscription(subName string) error {
 		}
 	}
 
+	serv.Mutex.Lock()
+	defer serv.Mutex.Unlock()
+
 	rowCount := 0
 	for rows.Next() {
 		dump := make([]interface{}, len(columns))
@@ -229,10 +255,16 @@ func (serv *Server) RefreshSubscription(subName string) error {
 		}
 		// Populate our stash of rows
 		if subSpec.GroupByColumn == "" {
-			for i, value := range dump {
-				subState.RegularRows.Data[columns[i]] = append(subState.RegularRows.Data[columns[i]], value)
+			if subSpec.MostRecent {
+				for i, value := range dump {
+					subState.RegularRows.Data[columns[i]] = []interface{}{value}
+				}
+			} else {
+				for i, value := range dump {
+					subState.RegularRows.Data[columns[i]] = append(subState.RegularRows.Data[columns[i]], value)
+				}
 			}
-			subState.RegularRows.Recompute()
+			subState.MostRecentId = max(subState.MostRecentId, subState.RegularRows.Recompute())
 		} else {
 			groupByValue := dump[groupByColumnIndex]
 			if _, ok := subState.GroupByRows[groupByValue]; !ok {
@@ -242,24 +274,35 @@ func (serv *Server) RefreshSubscription(subName string) error {
 				}
 			}
 			ourGroup := subState.GroupByRows[groupByValue]
-			for i, value := range dump {
-				ourGroup.Data[columns[i]] = append(ourGroup.Data[columns[i]], value)
+			if subSpec.MostRecent {
+				for i, value := range dump {
+					ourGroup.Data[columns[i]] = []interface{}{value}
+				}
+			} else {
+				for i, value := range dump {
+					ourGroup.Data[columns[i]] = append(ourGroup.Data[columns[i]], value)
+				}
 			}
-			ourGroup.Recompute()
+			subState.MostRecentId = max(subState.MostRecentId, ourGroup.Recompute())
 		}
 		rowCount++
-		if debugMode && ((rowCount < 10_000 && rowCount%1_000 == 0) ||
+		if debugMode && fullPrint && ((rowCount < 10_000 && rowCount%1_000 == 0) ||
 			(rowCount < 100_000 && rowCount%10_000 == 0) || rowCount%100_000 == 0) {
 			fmt.Printf("    ... %v rows so far\n", rowCount)
 		}
 	}
 
-	if debugMode {
-		fmt.Printf("    ... refreshed with a total of %v rows - took %v seconds\n", rowCount, time.Since(startTime).Seconds())
+	if debugMode && (fullPrint || rowCount > 0) {
+		fmt.Printf("\x1b[93mRefreshed:\x1b[0m %s - %v rows - took %.3v seconds\n", subName, rowCount, time.Since(startTime).Seconds())
 	}
 	//fmt.Printf("%#v\n", subState)
 
-	serv.Subscriptions[subName] = &subState
+	if rowCount > 0 {
+		for channel, _ := range serv.Clients {
+			channel <- WakeUpMessage{}
+		}
+	}
+
 	return nil
 }
 
@@ -460,7 +503,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 					subState.RegularRows.Data[columnName] = append(subState.RegularRows.Data[columnName], values...)
 				}
 			}
-			subState.RegularRows.Recompute()
+			subState.MostRecentId = max(subState.MostRecentId, subState.RegularRows.Recompute())
 		} else {
 			groupByColumnSlice := rowData.Data[subSpec.GroupByColumn]
 			for i := 0; i < rowData.Length; i++ {
@@ -481,7 +524,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 						ourGroup.Data[columnName] = append(ourGroup.Data[columnName], values...)
 					}
 				}
-				ourGroup.Recompute()
+				subState.MostRecentId = max(subState.MostRecentId, ourGroup.Recompute())
 			}
 		}
 	}
@@ -501,6 +544,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	return nil
 }
 
+// FIXME: This endpoint doesn't do anything yet! All you can do is authenticate.
 func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
 	authString, ok := r.Header["Authorization"]
 	if !ok || len(authString) != 1 {
@@ -729,6 +773,11 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					filterCursors[int64(val)] = cursorCell
 				case string:
 					filterCursors[val] = cursorCell
+				case bool:
+					filterCursors[val] = cursorCell
+				default:
+					errorMessage = "each filterCursor key must be an integer, string, or boolean"
+					goto bad
 				}
 			}
 
@@ -741,7 +790,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			case "append":
-				if !clientState.WritePermissionBit {
+				if !clientState.WritePermissionBit || serv.Config.ReadOnly {
 					errorMessage = "permission denied"
 				} else {
 					singleRow := make(map[string][]interface{})
@@ -756,7 +805,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 					errorMessage = fmt.Sprintf("invalid append: %s", err)
 				}
 			case "appendBatch":
-				if !clientState.WritePermissionBit {
+				if !clientState.WritePermissionBit || serv.Config.ReadOnly {
 					errorMessage = "permission denied"
 				} else {
 					rowData := DataRows{
@@ -775,6 +824,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 						SubscriptionName: protocolRequest.Subscription,
 						Cursor:           protocolRequest.Cursor,
 						FilterCursors:    filterCursors,
+						Limit:            protocolRequest.Limit,
 					}
 					err = serv.CatchUpCursor(c, protocolRequest.Token, &subCursor, true)
 					if err == nil {
@@ -790,6 +840,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 						SubscriptionName: protocolRequest.Subscription,
 						Cursor:           protocolRequest.Cursor,
 						FilterCursors:    filterCursors,
+						Limit:            protocolRequest.Limit,
 					}
 					err = serv.CatchUpCursor(c, protocolRequest.Token, clientState.Cursors[protocolRequest.Token], true)
 					if err == nil {
@@ -993,7 +1044,8 @@ func main() {
 	}
 
 	for subName := range config.Subscriptions {
-		err = server.RefreshSubscription(subName)
+		server.InitializeSubscription(subName)
+		err = server.RefreshSubscription(subName, true)
 		if err != nil {
 			log.Fatalf("Failed to start up: %v", err)
 		}
@@ -1002,9 +1054,23 @@ func main() {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		fmt.Printf(
-			"All %v subscriptions refreshed - %v MiB allocated - %v seconds to start up\n",
+			"All %v subscriptions refreshed - %v MiB allocated - %.3v seconds to start up\n",
 			len(config.Subscriptions), m.Alloc/1024/1024, time.Since(startUpTime).Seconds(),
 		)
+	}
+
+	if config.SQLPollingInterval > 0 {
+		go func() {
+			for {
+				time.Sleep(time.Microsecond * time.Duration(1e6*config.SQLPollingInterval))
+				for subName := range config.Subscriptions {
+					err = server.RefreshSubscription(subName, false)
+					if err != nil {
+						log.Printf("\x1b[91mFailed to refresh subscription %s:\x1b[0m %v", subName, err)
+					}
+				}
+			}
+		}()
 	}
 
 	http.HandleFunc("/ws", server.WebSocketEndpoint)
