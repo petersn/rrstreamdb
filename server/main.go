@@ -1060,15 +1060,17 @@ func main() {
 	}
 
 	if config.SQLPollingInterval > 0 {
+		fullPrint := true
 		go func() {
 			for {
 				time.Sleep(time.Microsecond * time.Duration(1e6*config.SQLPollingInterval))
 				for subName := range config.Subscriptions {
-					err = server.RefreshSubscription(subName, false)
+					err = server.RefreshSubscription(subName, fullPrint)
 					if err != nil {
 						log.Printf("\x1b[91mFailed to refresh subscription %s:\x1b[0m %v", subName, err)
 					}
 				}
+				fullPrint = false
 			}
 		}()
 	}
