@@ -309,7 +309,10 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	}
 
 	if debugMode && (fullPrint || rowCount > 0) {
-		fmt.Printf("\x1b[93mRefreshed:\x1b[0m %s - %v rows - took %.3f seconds\n", pull.DebugName, rowCount, time.Since(startTime).Seconds())
+		fmt.Printf(
+			"\x1b[93mRefreshed:\x1b[0m %s - %v rows - took %.3f seconds\n",
+			pull.DebugName, rowCount, time.Since(startTime).Seconds(),
+		)
 	}
 
 	dataRows.Recompute()
@@ -318,20 +321,31 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	return serv.UpdateSubscriptions(pull.TableName, dataRows)
 }
 
+// Returns the index of the first row in rowData with an id strictly greater
+// than largestSeen, or returns rowData.Length if there is no such row.
 func binarySearchForNewRecords(largestSeen int64, rowData *DataRows) int {
 	// Fast path is that there's no new data.
 	if largestSeen >= rowData.MostRecentId {
 		return rowData.Length
 	}
-	//lo, hi := 0, rowData.Length-1
-	// TODO: Implement binary search
 	ids := rowData.Data["id"]
-	for i, value := range ids {
-		if value.(int64) > largestSeen {
-			return i
+	// https://blog.nelhage.com/2015/08/indices-point-between-elements/
+	lo, hi := 0, rowData.Length
+	for lo < hi {
+		// NB: Possibly I should do interpolation search here, because that would be absurdly effective.
+		mid := (lo + hi) / 2
+		value := ids[mid].(int64)
+		if value < largestSeen {
+			// If ids[mid] is too small then the first row must be strictly to the right
+			lo = mid + 1
+		} else if value == largestSeen {
+			return mid
+		} else {
+			// If ids[mid] is too large then the first row must be weakly to its left
+			hi = mid
 		}
 	}
-	return len(ids)
+	return lo
 }
 
 func (serv *Server) CatchUpCursor(
@@ -715,7 +729,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if debugMode {
-				fmt.Printf("\x1b[93mRecv[%p]:\x1b[0m %s\n", c, message)
+				fmt.Printf("\x1b[95mRecv[%p]:\x1b[0m %s\n", c, message)
 			}
 			if len(message) == 0 {
 				log.Println("\x1b[91mlength zero message?\x1b[0m")
