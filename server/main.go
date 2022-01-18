@@ -601,10 +601,12 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 
 	// First we update all relevant subscriptions.
 	for _, subState := range serv.Subscriptions {
+		LOCKMESSAGE(fmt.Sprintf("UpdateSubscriptions - Updating for: %s:%s", subState.SubscriptionSpec.TableName, subState.SubscriptionSpec.GroupByColumn))
 		subSpec := subState.SubscriptionSpec
 		if subSpec.TableName != tableName {
 			continue
 		}
+		LOCKMESSAGE(fmt.Sprintf("UpdateSubscriptions - Really updating for: %s:%s", subState.SubscriptionSpec.TableName, subState.SubscriptionSpec.GroupByColumn))
 		idsSlice := rowData.Data["id"]
 		if subSpec.GroupByColumn == "" {
 			id := idsSlice[len(idsSlice)-1].(int64)
@@ -630,6 +632,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 			groupByColumnSlice := rowData.Data[subSpec.GroupByColumn]
 			// Apply each row in turn, so we can split it out into the appropriate group
 			for i := 0; i < rowData.Length; i++ {
+				LOCKMESSAGE(fmt.Sprintf("UpdateSubscriptions - Iterating rows: %s:%s - %v", subState.SubscriptionSpec.TableName, subState.SubscriptionSpec.GroupByColumn, i))
 				groupByValue := groupByColumnSlice[i]
 				id := idsSlice[i].(int64)
 				if _, ok := subState.GroupByRows[groupByValue]; !ok {
@@ -657,6 +660,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 			}
 		}
 	}
+	LOCKMESSAGE("UpdateSubscriptions - Reached end of loop")
 
 	//pp.Print(serv.Subscriptions)
 
