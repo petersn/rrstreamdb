@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -151,6 +152,7 @@ func WriteMessage(conn *websocket.Conn, message []byte) error {
 }
 
 func (serv *Server) RefreshSubscription(subName string) error {
+	startTime := time.Now()
 	if debugMode {
 		fmt.Printf("\x1b[93mRefreshing subscription:\x1b[0m %s\n", subName)
 	}
@@ -246,13 +248,14 @@ func (serv *Server) RefreshSubscription(subName string) error {
 			ourGroup.Recompute()
 		}
 		rowCount++
-		if debugMode && ((rowCount < 100_000 && rowCount%1_000 == 0) || rowCount%10_000 == 0) {
+		if debugMode && ((rowCount < 10_000 && rowCount%1_000 == 0) ||
+			(rowCount < 100_000 && rowCount%10_000 == 0) || rowCount%100_000 == 0) {
 			fmt.Printf("    ... %v rows so far\n", rowCount)
 		}
 	}
 
 	if debugMode {
-		fmt.Printf("    ... refreshed with a total of %v rows\n", rowCount)
+		fmt.Printf("    ... refreshed with a total of %v rows - took %v seconds\n", rowCount, time.Since(startTime).Seconds())
 	}
 	//fmt.Printf("%#v\n", subState)
 
@@ -896,6 +899,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	startUpTime := time.Now()
 	configPath := flag.String("config", "streamdb-config.yaml", "Config file to load")
 	makeAuthToken := flag.String("make-auth-token", "", "Make an auth token for a given claim")
 	applySchema := flag.Bool("apply-schema", false, "If true we create any required tables")
@@ -995,7 +999,12 @@ func main() {
 		}
 	}
 	if debugMode {
-		fmt.Printf("All %v subscriptions refreshed\n", len(config.Subscriptions))
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		fmt.Printf(
+			"All %v subscriptions refreshed - %v MiB allocated - %v seconds to start up\n",
+			len(config.Subscriptions), m.Alloc/1024/1024, time.Since(startUpTime).Seconds(),
+		)
 	}
 
 	http.HandleFunc("/ws", server.WebSocketEndpoint)
