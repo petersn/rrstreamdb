@@ -30,11 +30,11 @@ import (
 TODO:
 [*] Add SQL polling
 [ ] Make sure I'm appropriately locking everywhere
-[ ] Plain HTTP handler
+[*] Plain HTTP handler
 [ ] Add listen/unlisten commands that just stream new rows
 [*] Deduplicate what gets loaded between subscriptions to the same table
 [ ] Make wakeup smarter (only wake up appropriate listeners)
-[ ] Implement binary search properly
+[*] Implement binary search properly
 [ ] Implement "limit" requests properly
 [ ] Possibly implement a database -> config scraper
 */
@@ -160,6 +160,10 @@ type Server struct {
 	Clients       map[chan WakeUpMessage]*ClientState
 	Subscriptions map[string]*SubscriptionState
 	TablePulls    []*TablePull
+}
+
+type ReplyFunction interface {
+	Write(message []byte) error
 }
 
 func max(a, b int64) int64 {
@@ -349,7 +353,7 @@ func binarySearchForNewRecords(largestSeen int64, rowData *DataRows) int {
 }
 
 func (serv *Server) CatchUpCursor(
-	conn *websocket.Conn,
+	reply ReplyFunction,
 	token int64,
 	cursor *SubscriptionCursor,
 	sendEmpty bool,
@@ -393,7 +397,7 @@ func (serv *Server) CatchUpCursor(
 		if err != nil {
 			return err
 		}
-		err = WriteMessage(conn, bytes)
+		err = reply.Write(bytes)
 		if err != nil {
 			return err
 		}
@@ -557,50 +561,6 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	return nil
 }
 
-// FIXME: This endpoint doesn't do anything yet! All you can do is authenticate.
-func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
-	authString, ok := r.Header["Authorization"]
-	if !ok || len(authString) != 1 {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	parts := strings.Split(authString[0], " ")
-	if len(parts) != 2 || parts[0] != "Basic" {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	authToken, err := base64.StdEncoding.DecodeString(parts[1])
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	usernameAndPasswordParts := strings.SplitN(string(authToken), ":", 2)
-	if len(usernameAndPasswordParts) != 2 {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	clientState, err := serv.MakeClient([]byte(usernameAndPasswordParts[1]))
-	if err != nil {
-		json.NewEncoder(w).Encode(struct {
-			Kind    string `json:"kind"`
-			Message string `json:"message"`
-		}{
-			Kind:    "error",
-			Message: fmt.Sprint(err),
-		})
-		return
-	}
-	_ = clientState
-	json.NewEncoder(w).Encode(struct {
-		Kind    string `json:"kind"`
-		Message string `json:"message"`
-	}{
-		Kind:    "success",
-		Message: "ok",
-	})
-}
-
 func (serv *Server) MakeClient(authToken []byte) (*ClientState, error) {
 	// Split into claim-signature
 	authTokenParts := bytes.SplitN(authToken, []byte("-"), 2)
@@ -649,33 +609,215 @@ func (serv *Server) MakeClient(authToken []byte) (*ClientState, error) {
 	return clientState, nil
 }
 
+func (serv *Server) HandleMessage(reply ReplyFunction, clientState *ClientState, message string) error {
+	if time.Now().Unix() > clientState.ValidityUntilUnix {
+		reply.Write([]byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+		return errors.New("auth expired")
+	}
+
+	bytes := []byte("")
+	errorMessage := ""
+	filterCursors := make(map[interface{}]*int64)
+	var protocolRequest ProtocolRequest
+	err := json.Unmarshal([]byte(message), &protocolRequest)
+	if err != nil {
+		log.Println("failed to parse:", err)
+		errorMessage = fmt.Sprintf("failed to parse: %s", err)
+		goto bad
+	}
+
+	for _, cursor := range protocolRequest.FilterCursors {
+		if len(cursor) != 2 {
+			errorMessage = "each filterCursor entry must be of length two, like: [\"foo\", 37]"
+			goto bad
+		}
+		cursorPos, ok := cursor[1].(float64)
+		if !ok {
+			errorMessage = "each filterCursor entry must have an integer id as its second entry"
+			goto bad
+		}
+		_ = cursorPos
+		cursorCell := new(int64)
+		*cursorCell = int64(cursorPos)
+		switch val := cursor[0].(type) {
+		case float64:
+			filterCursors[int64(val)] = cursorCell
+		case string:
+			filterCursors[val] = cursorCell
+		case bool:
+			filterCursors[val] = cursorCell
+		default:
+			errorMessage = "each filterCursor key must be an integer, string, or boolean"
+			goto bad
+		}
+	}
+
+	switch protocolRequest.Kind {
+	case "ping":
+		err = reply.Write([]byte("{\"kind\": \"pong\"}"))
+		if err != nil {
+			log.Println("write:", err)
+			return errors.New("write failed")
+		}
+		return nil
+	case "append":
+		if !clientState.WritePermissionBit || serv.Config.ReadOnly {
+			errorMessage = "permission denied"
+		} else {
+			singleRow := make(map[string][]interface{})
+			for k, v := range protocolRequest.Row {
+				singleRow[k] = []interface{}{v}
+			}
+			if err = serv.AppendRows(protocolRequest.Table, DataRows{Data: singleRow}); err == nil {
+				goto good
+			}
+			errorMessage = fmt.Sprintf("invalid append: %s", err)
+		}
+	case "appendBatch":
+		if !clientState.WritePermissionBit || serv.Config.ReadOnly {
+			errorMessage = "permission denied"
+		} else {
+			if err = serv.AppendRows(protocolRequest.Table, DataRows{Data: protocolRequest.Rows}); err == nil {
+				goto good
+			}
+			errorMessage = fmt.Sprintf("invalid appendBatch: %s", err)
+		}
+	case "query":
+		if _, ok := serv.Config.Subscriptions[protocolRequest.Subscription]; ok {
+			subCursor := SubscriptionCursor{
+				SubscriptionName: protocolRequest.Subscription,
+				Cursor:           protocolRequest.Cursor,
+				FilterCursors:    filterCursors,
+				Limit:            protocolRequest.Limit,
+			}
+			err = serv.CatchUpCursor(reply, protocolRequest.Token, &subCursor, true)
+			if err == nil {
+				return nil
+			}
+			errorMessage = fmt.Sprintf("query failure: %s", err)
+		} else {
+			errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
+		}
+	case "subscribe":
+		if _, ok := serv.Config.Subscriptions[protocolRequest.Subscription]; ok {
+			clientState.Cursors[protocolRequest.Token] = &SubscriptionCursor{
+				SubscriptionName: protocolRequest.Subscription,
+				Cursor:           protocolRequest.Cursor,
+				FilterCursors:    filterCursors,
+				Limit:            protocolRequest.Limit,
+			}
+			err = serv.CatchUpCursor(reply, protocolRequest.Token, clientState.Cursors[protocolRequest.Token], true)
+			if err == nil {
+				return nil
+			}
+			errorMessage = fmt.Sprintf("subscribe failure: %s", err)
+		} else {
+			errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
+		}
+	case "unsubscribe":
+		if _, ok := clientState.Cursors[protocolRequest.Token]; ok {
+			delete(clientState.Cursors, protocolRequest.Token)
+			goto good
+		} else {
+			errorMessage = "unknown subscription token"
+		}
+	case "getSchema":
+		bytes, err := json.Marshal(struct {
+			Kind          string      `json:"kind"`
+			Token         int64       `json:"token"`
+			Tables        interface{} `json:"tables"`
+			Subscriptions interface{} `json:"subscriptions"`
+		}{
+			Kind:          "getSchema",
+			Token:         protocolRequest.Token,
+			Tables:        serv.Config.Tables,
+			Subscriptions: serv.Config.Subscriptions,
+		})
+		if err != nil {
+			log.Println("json marshal:", err)
+			return errors.New("json marshal failed")
+		}
+		err = reply.Write(bytes)
+		if err != nil {
+			log.Println("write:", err)
+			return errors.New("write failed")
+		}
+		return nil
+	case "setSchema":
+		if !clientState.AdminPermissionBit {
+			errorMessage = "permission denied"
+		} else {
+			errorMessage = "not implemented yet"
+		}
+	}
+
+bad:
+	log.Printf("bad request: %#v", errorMessage)
+	bytes, err = json.Marshal(struct {
+		Kind    string `json:"kind"`
+		Token   int64  `json:"token"`
+		Message string `json:"message"`
+	}{
+		Kind:    "error",
+		Token:   protocolRequest.Token,
+		Message: errorMessage,
+	})
+	if err != nil {
+		log.Println("marshal:", err)
+		return errors.New("marshal failed")
+	}
+	err = reply.Write(bytes)
+	if err != nil {
+		log.Println("write:", err)
+		return errors.New("write failed")
+	}
+	return nil
+
+good:
+	// Token is an int64, I'm okay with not properly marshaling here.
+	err = reply.Write([]byte(fmt.Sprintf("{\"kind\": \"ok\", \"token\": %v}", protocolRequest.Token)))
+	if err != nil {
+		log.Println("write:", err)
+		return errors.New("write failed")
+	}
+	return nil
+}
+
+type WebsocketReplyFunction struct {
+	Conn *websocket.Conn
+}
+
+func (wsReplyFunc *WebsocketReplyFunction) Write(message []byte) error {
+	return WriteMessage(wsReplyFunc.Conn, message)
+}
+
 func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 	var bytes []byte
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
-	c, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Print("upgrade:", err)
 		return
 	}
 	if debugMode {
-		fmt.Printf("\x1b[91mOpen[%p]\x1b[0m\n", c)
+		fmt.Printf("\x1b[91mOpen[%p]\x1b[0m\n", conn)
 	}
 	ticker := time.NewTicker(PING_PERIOD)
 	defer func() {
 		if debugMode {
-			fmt.Printf("\x1b[91mClose[%p]\x1b[0m\n", c)
+			fmt.Printf("\x1b[91mClose[%p]\x1b[0m\n", conn)
 		}
-		c.Close()
+		conn.Close()
 		ticker.Stop()
 	}()
-	c.SetPongHandler(func(x string) error {
-		c.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
+	conn.SetPongHandler(func(x string) error {
+		conn.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
 		return nil
 	})
 
 	// Read an initial auth message that must be equal to the secret password.
-	c.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
-	mt, message, err := c.ReadMessage()
+	conn.SetReadDeadline(time.Now().Add(PING_PERIOD + 5*time.Second))
+	mt, message, err := conn.ReadMessage()
 	if err != nil || mt != websocket.TextMessage {
 		log.Print("bad auth message:", err)
 		return
@@ -694,14 +836,14 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			log.Println("marshal:", err)
 			return
 		}
-		err = WriteMessage(c, bytes)
+		err = WriteMessage(conn, bytes)
 		if err != nil {
 			log.Println("write:", err)
 		}
 		return
 	}
 
-	err = WriteMessage(c, []byte(fmt.Sprintf("{\"kind\": \"auth\", \"version\": \"%s\"}", VERSION)))
+	err = WriteMessage(conn, []byte(fmt.Sprintf("{\"kind\": \"auth\", \"version\": \"%s\"}", VERSION)))
 	if err != nil {
 		log.Println("write:", err)
 		return
@@ -723,13 +865,13 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		for {
 			//log.Println("loop on reading message")
-			mt, message, err := c.ReadMessage()
+			mt, message, err := conn.ReadMessage()
 			if err != nil || mt != websocket.TextMessage {
 				log.Println("read:", err)
 				break
 			}
 			if debugMode {
-				fmt.Printf("\x1b[95mRecv[%p]:\x1b[0m %s\n", c, message)
+				fmt.Printf("\x1b[95mRecv[%p]:\x1b[0m %s\n", conn, message)
 			}
 			if len(message) == 0 {
 				log.Println("\x1b[91mlength zero message?\x1b[0m")
@@ -740,201 +882,92 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		close(messageChannel)
 	}()
 
+	connReplyFunction := WebsocketReplyFunction{Conn: conn}
+
 	for {
 		select {
 		case message := <-messageChannel:
 			if message == "" {
 				return
 			}
-			if time.Now().Unix() > clientState.ValidityUntilUnix {
-				WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+			if err = serv.HandleMessage(&connReplyFunction, clientState, message); err != nil {
+				log.Println("error handling:", err)
 				return
 			}
-
-			errorMessage := ""
-			filterCursors := make(map[interface{}]*int64)
-			var protocolRequest ProtocolRequest
-			err = json.Unmarshal([]byte(message), &protocolRequest)
-			if err != nil {
-				log.Println("failed to parse:", err)
-				errorMessage = fmt.Sprintf("failed to parse: %s", err)
-				goto bad
-			}
-
-			for _, cursor := range protocolRequest.FilterCursors {
-				if len(cursor) != 2 {
-					errorMessage = "each filterCursor entry must be of length two, like: [\"foo\", 37]"
-					goto bad
-				}
-				cursorPos, ok := cursor[1].(float64)
-				if !ok {
-					errorMessage = "each filterCursor entry must have an integer id as its second entry"
-					goto bad
-				}
-				_ = cursorPos
-				cursorCell := new(int64)
-				*cursorCell = int64(cursorPos)
-				switch val := cursor[0].(type) {
-				case float64:
-					filterCursors[int64(val)] = cursorCell
-				case string:
-					filterCursors[val] = cursorCell
-				case bool:
-					filterCursors[val] = cursorCell
-				default:
-					errorMessage = "each filterCursor key must be an integer, string, or boolean"
-					goto bad
-				}
-			}
-
-			switch protocolRequest.Kind {
-			case "ping":
-				err = WriteMessage(c, []byte("{\"kind\": \"pong\"}"))
-				if err != nil {
-					log.Println("write:", err)
-					return
-				}
-				continue
-			case "append":
-				if !clientState.WritePermissionBit || serv.Config.ReadOnly {
-					errorMessage = "permission denied"
-				} else {
-					singleRow := make(map[string][]interface{})
-					for k, v := range protocolRequest.Row {
-						singleRow[k] = []interface{}{v}
-					}
-					if err = serv.AppendRows(protocolRequest.Table, DataRows{Data: singleRow}); err == nil {
-						goto good
-					}
-					errorMessage = fmt.Sprintf("invalid append: %s", err)
-				}
-			case "appendBatch":
-				if !clientState.WritePermissionBit || serv.Config.ReadOnly {
-					errorMessage = "permission denied"
-				} else {
-					if err = serv.AppendRows(protocolRequest.Table, DataRows{Data: protocolRequest.Rows}); err == nil {
-						goto good
-					}
-					errorMessage = fmt.Sprintf("invalid appendBatch: %s", err)
-				}
-			case "query":
-				if _, ok := serv.Config.Subscriptions[protocolRequest.Subscription]; ok {
-					subCursor := SubscriptionCursor{
-						SubscriptionName: protocolRequest.Subscription,
-						Cursor:           protocolRequest.Cursor,
-						FilterCursors:    filterCursors,
-						Limit:            protocolRequest.Limit,
-					}
-					err = serv.CatchUpCursor(c, protocolRequest.Token, &subCursor, true)
-					if err == nil {
-						continue
-					}
-					errorMessage = fmt.Sprintf("query failure: %s", err)
-				} else {
-					errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
-				}
-			case "subscribe":
-				if _, ok := serv.Config.Subscriptions[protocolRequest.Subscription]; ok {
-					clientState.Cursors[protocolRequest.Token] = &SubscriptionCursor{
-						SubscriptionName: protocolRequest.Subscription,
-						Cursor:           protocolRequest.Cursor,
-						FilterCursors:    filterCursors,
-						Limit:            protocolRequest.Limit,
-					}
-					err = serv.CatchUpCursor(c, protocolRequest.Token, clientState.Cursors[protocolRequest.Token], true)
-					if err == nil {
-						continue
-					}
-					errorMessage = fmt.Sprintf("subscribe failure: %s", err)
-				} else {
-					errorMessage = fmt.Sprintf("unknown subscription: %#v", protocolRequest.Subscription)
-				}
-			case "unsubscribe":
-				if _, ok := clientState.Cursors[protocolRequest.Token]; ok {
-					delete(clientState.Cursors, protocolRequest.Token)
-					goto good
-				} else {
-					errorMessage = "unknown subscription token"
-				}
-			case "getSchema":
-				bytes, err = json.Marshal(struct {
-					Kind          string      `json:"kind"`
-					Token         int64       `json:"token"`
-					Tables        interface{} `json:"tables"`
-					Subscriptions interface{} `json:"subscriptions"`
-				}{
-					Kind:          "getSchema",
-					Token:         protocolRequest.Token,
-					Tables:        serv.Config.Tables,
-					Subscriptions: serv.Config.Subscriptions,
-				})
-				if err != nil {
-					log.Println("json marshal:", err)
-					return
-				}
-				err = WriteMessage(c, bytes)
-				if err != nil {
-					log.Println("write:", err)
-					return
-				}
-				continue
-			case "setSchema":
-				if !clientState.AdminPermissionBit {
-					errorMessage = "permission denied"
-				} else {
-					errorMessage = "not implemented yet"
-				}
-			}
-
-		bad:
-			log.Printf("bad request: %#v", errorMessage)
-			bytes, err = json.Marshal(struct {
-				Kind    string `json:"kind"`
-				Token   int64  `json:"token"`
-				Message string `json:"message"`
-			}{
-				Kind:    "error",
-				Token:   protocolRequest.Token,
-				Message: errorMessage,
-			})
-			if err != nil {
-				log.Println("marshal:", err)
-				return
-			}
-			err = WriteMessage(c, bytes)
-			if err != nil {
-				log.Println("write:", err)
-				return
-			}
-			continue
-
-		good:
-			// Token is an int64, I'm okay with not properly marshaling here.
-			err = WriteMessage(c, []byte(fmt.Sprintf("{\"kind\": \"ok\", \"token\": %v}", protocolRequest.Token)))
-			if err != nil {
-				log.Println("write:", err)
-				return
-			}
-
 		case <-wakeupChannel:
 			if time.Now().Unix() > clientState.ValidityUntilUnix {
-				WriteMessage(c, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+				WriteMessage(conn, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
 				return
 			}
 			for token, subCursor := range clientState.Cursors {
-				if err = serv.CatchUpCursor(c, token, subCursor, false); err != nil {
+				if err = serv.CatchUpCursor(&connReplyFunction, token, subCursor, false); err != nil {
 					log.Println("cursor:", err)
 					return
 				}
 			}
-
 		case <-ticker.C:
-			c.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
-			if err = c.WriteMessage(websocket.PingMessage, nil); err != nil {
+			conn.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
+			if err = conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
 	}
+}
+
+type PlainReplyFunction struct {
+	Dump []byte
+}
+
+func (plainReplyFunc *PlainReplyFunction) Write(message []byte) error {
+	plainReplyFunc.Dump = message
+	return nil
+}
+
+func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
+	authString, ok := r.Header["Authorization"]
+	if !ok || len(authString) != 1 {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	parts := strings.Split(authString[0], " ")
+	if len(parts) != 2 || parts[0] != "Basic" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	authToken, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	usernameAndPasswordParts := strings.SplitN(string(authToken), ":", 2)
+	if len(usernameAndPasswordParts) != 2 {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	clientState, err := serv.MakeClient([]byte(usernameAndPasswordParts[1]))
+	if err != nil {
+		json.NewEncoder(w).Encode(struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		}{
+			Kind:    "error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	message, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println("read:", err)
+		return
+	}
+
+	plainReplyFunction := PlainReplyFunction{}
+	if err = serv.HandleMessage(&plainReplyFunction, clientState, string(message)); err != nil {
+		log.Println("error handling:", err)
+	}
+	w.Write(plainReplyFunction.Dump)
 }
 
 func main() {
