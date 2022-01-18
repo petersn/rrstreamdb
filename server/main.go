@@ -593,6 +593,7 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	}
 	LOCKMESSAGE("UpdateSubscriptions - Mutex.Lock")
 	serv.Mutex.Lock()
+	LOCKMESSAGE("UpdateSubscriptions - Got lock!")
 	defer func() {
 		LOCKMESSAGE("UpdateSubscriptions - Mutex.Unlock")
 		serv.Mutex.Unlock()
@@ -828,16 +829,16 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 	// TODO: Think carefully about this channel size. At size 0 we deadlock.
 	// I think we might deadlock at any finite size in some situations, but maybe 1 suffices?
 	wakeupChannel := make(chan WakeUpMessage, 128)
-	//LOCKMESSAGE("About to lock...")
+	LOCKMESSAGE("About to lock...")
 	serv.Mutex.Lock()
-	//LOCKMESSAGE("Got lock!")
+	LOCKMESSAGE("Got lock!")
 	serv.Clients[wakeupChannel] = clientState
 	serv.Mutex.Unlock()
 	defer func() {
-		//LOCKMESSAGE("Locking")
+		LOCKMESSAGE("Locking")
 		serv.Mutex.Lock()
 		delete(serv.Clients, wakeupChannel)
-		//LOCKMESSAGE("Unlocking")
+		LOCKMESSAGE("Unlocking")
 		serv.Mutex.Unlock()
 	}()
 
