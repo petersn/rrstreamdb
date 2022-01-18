@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,7 +32,7 @@ TODO:
 [ ] Plain HTTP handler
 */
 
-const VERSION = "v0.0"
+const VERSION = "v0.1"
 const PING_PERIOD = 30 * time.Second
 const WRITE_WAIT = 10 * time.Second
 
@@ -42,11 +43,12 @@ var sqlTypeMapping = map[string]string{
 	"Float":           "DOUBLE PRECISION NOT NULL",
 	"Integer":         "INTEGER NOT NULL",
 	"Boolean":         "BOOLEAN NOT NULL",
+	"JSON":            "JSONB NOT NULL",
 	"NullableText":    "TEXT",
 	"NullableFloat":   "DOUBLE PRECISION",
 	"NullableInteger": "INTEGER",
 	"NullableBoolean": "BOOLEAN",
-	"JSON":            "JSONB NOT NULL",
+	"NullableJSON":    "JSONB",
 }
 
 var upgrader = websocket.Upgrader{}
@@ -149,7 +151,9 @@ func WriteMessage(conn *websocket.Conn, message []byte) error {
 }
 
 func (serv *Server) RefreshSubscription(subName string) error {
-	//fmt.Printf("\x1b[91mRefreshing subscription\x1b[0m: %s\n", subName)
+	if debugMode {
+		fmt.Printf("\x1b[93mRefreshing subscription:\x1b[0m %s\n", subName)
+	}
 	subSpec := serv.Config.Subscriptions[subName]
 	subState := SubscriptionState{SubscriptionSpec: subSpec}
 	if subSpec.GroupByColumn == "" {
@@ -209,6 +213,7 @@ func (serv *Server) RefreshSubscription(subName string) error {
 		}
 	}
 
+	rowCount := 0
 	for rows.Next() {
 		dump := make([]interface{}, len(columns))
 		dumpPtrs := make([]interface{}, len(columns))
@@ -240,8 +245,15 @@ func (serv *Server) RefreshSubscription(subName string) error {
 			}
 			ourGroup.Recompute()
 		}
+		rowCount++
+		if debugMode && ((rowCount < 100_000 && rowCount%1_000 == 0) || rowCount%10_000 == 0) {
+			fmt.Printf("    ... %v rows so far\n", rowCount)
+		}
 	}
 
+	if debugMode {
+		fmt.Printf("    ... refreshed with a total of %v rows\n", rowCount)
+	}
 	//fmt.Printf("%#v\n", subState)
 
 	serv.Subscriptions[subName] = &subState
@@ -486,7 +498,6 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	return nil
 }
 
-/*
 func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
 	authString, ok := r.Header["Authorization"]
 	if !ok || len(authString) != 1 {
@@ -529,7 +540,6 @@ func (serv *Server) PlainEndpoint(w http.ResponseWriter, r *http.Request) {
 		Message: "ok",
 	})
 }
-*/
 
 func (serv *Server) MakeClient(authToken []byte) (*ClientState, error) {
 	// Split into claim-signature
@@ -984,9 +994,12 @@ func main() {
 			log.Fatalf("Failed to start up: %v", err)
 		}
 	}
+	if debugMode {
+		fmt.Printf("All %v subscriptions refreshed\n", len(config.Subscriptions))
+	}
 
 	http.HandleFunc("/ws", server.WebSocketEndpoint)
-	//http.HandleFunc("/api", server.PlainEndpoint)
+	http.HandleFunc("/api", server.PlainEndpoint)
 	if config.EnableTLS {
 		if config.CertFile == "" || config.KeyFile == "" {
 			log.Fatal("You must specify certFile and keyFile in the config")
