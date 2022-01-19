@@ -100,7 +100,7 @@ type ServerConfig struct {
 
 type SubscriptionSpec struct {
 	TableName     string `yaml:"table" json:"table"`
-	GroupByColumn string `yaml:"groupBy" json:"groupyBy,omitempty"` // "" means no grouping
+	GroupByColumn string `yaml:"groupBy" json:"groupBy,omitempty"` // "" means no grouping
 	MostRecent    bool   `yaml:"mostRecent" json:"mostRecent"`
 }
 
