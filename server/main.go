@@ -30,6 +30,7 @@ import (
 /*
 TODO:
 [*] Add SQL polling
+[*] I'm pretty sure my SQL polling implementation has a race with the main threads
 [ ] Make sure I'm appropriately locking everywhere
 [*] Plain HTTP handler
 [ ] Add listen/unlisten commands that just stream new rows
@@ -40,7 +41,7 @@ TODO:
 [ ] Possibly implement a database -> config scraper
 */
 
-const VERSION = "v0.1"
+const VERSION = "v0.2.2"
 const PING_PERIOD = 30 * time.Second
 const WRITE_WAIT = 10 * time.Second
 
@@ -217,11 +218,15 @@ func (serv *Server) InitializeSubscriptions() {
 			// and we can't get away with only pulling the most recent record overall
 			highestPullNeededByTable[subSpec.TableName] = max(highestPullNeededByTable[subSpec.TableName], PullNewestByGroup)
 			columns[subSpec.GroupByColumn] = struct{}{}
+		} else {
+			highestPullNeededByTable[subSpec.TableName] = max(highestPullNeededByTable[subSpec.TableName], PullJustNewest)
 		}
 	}
 
 	// Create table pulls
-	fmt.Printf("\x1b[93mPulling plan:\x1b[0m\n")
+	if debugMode {
+		fmt.Printf("\x1b[93mPulling plan:\x1b[0m\n")
+	}
 	for tableName, pullKind := range highestPullNeededByTable {
 		// If we need to pull the newest by group, then we need to create one table pull for each group by column
 		if pullKind == PullNewestByGroup {
@@ -256,6 +261,10 @@ func (serv *Server) InitializeSubscriptions() {
 }
 
 func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
+	// We must lock immediately as all access to TablePulls is synchronized by this mutex.
+	serv.DatabaseMutex.Lock()
+	defer serv.DatabaseMutex.Unlock()
+
 	startTime := time.Now()
 	if debugMode && fullPrint {
 		fmt.Printf("\x1b[93mPulling table:\x1b[0m %s\n", pull.TableName)
@@ -277,8 +286,6 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	}
 
 	// Read all of the corresponding rows
-	serv.DatabaseMutex.Lock()
-	defer serv.DatabaseMutex.Unlock()
 	rows, err := serv.Database.Query(query)
 	if err != nil {
 		log.Fatalf("could not execute query: %#v", err)
@@ -325,7 +332,6 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	}
 
 	dataRows.Recompute()
-	pull.MostRecentId = max(pull.MostRecentId, dataRows.MostRecentId)
 
 	return serv.UpdateSubscriptions(pull.TableName, dataRows)
 }
@@ -348,7 +354,7 @@ func binarySearchForNewRecords(largestSeen int64, rowData *DataRows) int {
 			// If ids[mid] is too small then the first row must be strictly to the right
 			lo = mid + 1
 		} else if value == largestSeen {
-			return mid
+			return mid + 1
 		} else {
 			// If ids[mid] is too large then the first row must be weakly to its left
 			hi = mid
@@ -483,10 +489,12 @@ func (serv *Server) AppendRows(tableName string, rowData DataRows) error {
 	}
 	rowData.Data["id"] = ids
 	rowData.Data["created_at"] = createdAts
+	rowData.Recompute()
 
 	return serv.UpdateSubscriptions(tableName, rowData)
 }
 
+// You must be holding the DatabaseMutex to call this function.
 func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) error {
 	// It is somewhat subtle that this logic here is even correct, because we could get duplicate rows into
 	// UpdateSubscriptions due to multiple pulls on the same table with differing group-by columns. However,
@@ -499,6 +507,13 @@ func (serv *Server) UpdateSubscriptions(tableName string, rowData DataRows) erro
 	}
 	serv.Mutex.Lock()
 	defer serv.Mutex.Unlock()
+
+	// Sort of inefficient iteration.
+	for _, pull := range serv.TablePulls {
+		if pull.TableName == tableName {
+			pull.MostRecentId = max(pull.MostRecentId, rowData.MostRecentId)
+		}
+	}
 
 	// First we update all relevant subscriptions.
 	for _, subState := range serv.Subscriptions {
@@ -1024,7 +1039,13 @@ func main() {
 	makeAuthToken := flag.String("make-auth-token", "", "Make an auth token for a given claim")
 	applySchema := flag.Bool("apply-schema", false, "If true we create any required tables")
 	debugModeFlag := flag.Bool("debug-mode", false, "Print info on every message in and out")
+	version := flag.Bool("version", false, "Show version number: "+VERSION)
 	flag.Parse()
+
+	if *version {
+		fmt.Printf("StreamDB version %s\n", VERSION)
+		return
+	}
 
 	// Parse the config file.
 	configYaml, err := ioutil.ReadFile(*configPath)
@@ -1104,7 +1125,7 @@ func main() {
 	if debugMode {
 		fmt.Print("\x1b[93mDebug mode\x1b[0m - ")
 	}
-	fmt.Printf("StreamDB binding to %s\n", config.Host)
+	fmt.Printf("StreamDB version %s binding to %s\n", VERSION, config.Host)
 	server := Server{
 		Config:        &config,
 		Database:      db,
@@ -1146,7 +1167,7 @@ func main() {
 	}
 
 	http.HandleFunc("/ws", server.WebSocketEndpoint)
-	http.HandleFunc("/api", server.PlainEndpoint)
+	http.HandleFunc("/rest", server.PlainEndpoint)
 	if config.EnableTLS {
 		if config.CertFile == "" || config.KeyFile == "" {
 			log.Fatal("You must specify certFile and keyFile in the config")
