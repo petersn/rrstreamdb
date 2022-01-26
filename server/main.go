@@ -23,7 +23,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
 )
 
@@ -41,7 +43,7 @@ TODO:
 [ ] Possibly implement a database -> config scraper
 */
 
-const VERSION = "v0.2.2"
+const VERSION = "v0.2.3"
 const PING_PERIOD = 30 * time.Second
 const WRITE_WAIT = 10 * time.Second
 
@@ -82,7 +84,8 @@ func (dr *DataRows) Recompute() {
 }
 
 type ServerConfig struct {
-	PostgresUrl        string  `yaml:"postgresUrl"`
+	DatabaseUrl        string  `yaml:"databaseUrl"`
+	DatabaseDriver     string  `yaml:"databaseDriver"`
 	Host               string  `yaml:"host"`
 	HmacSecret         string  `yaml:"hmacSecret"`
 	CertFile           string  `yaml:"certFile"`
@@ -634,7 +637,7 @@ func (serv *Server) HandleMessage(reply ReplyFunction, clientState *ClientState,
 	atomic.AddInt64(&serv.BytesReceived, int64(len(message)))
 
 	if time.Now().Unix() > clientState.ValidityUntilUnix {
-		reply.Write([]byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+		reply.Write([]byte(`{"kind": "error", "message": "auth expired"}`))
 		return errors.New("auth expired")
 	}
 
@@ -651,7 +654,7 @@ func (serv *Server) HandleMessage(reply ReplyFunction, clientState *ClientState,
 
 	for _, cursor := range protocolRequest.FilterCursors {
 		if len(cursor) != 2 {
-			errorMessage = "each filterCursor entry must be of length two, like: [\"foo\", 37]"
+			errorMessage = `each filterCursor entry must be of length two, like: ["foo", 37]`
 			goto bad
 		}
 		cursorPos, ok := cursor[1].(float64)
@@ -677,7 +680,7 @@ func (serv *Server) HandleMessage(reply ReplyFunction, clientState *ClientState,
 
 	switch protocolRequest.Kind {
 	case "ping":
-		err = reply.Write([]byte("{\"kind\": \"pong\"}"))
+		err = reply.Write([]byte(`{"kind": "pong"}`))
 		if err != nil {
 			log.Println("write:", err)
 			return errors.New("write failed")
@@ -835,7 +838,7 @@ bad:
 
 good:
 	// Token is an int64, I'm okay with not properly marshaling here.
-	err = reply.Write([]byte(fmt.Sprintf("{\"kind\": \"ok\", \"token\": %v}", protocolRequest.Token)))
+	err = reply.Write([]byte(fmt.Sprintf(`{"kind": "ok", "token": %v}`, protocolRequest.Token)))
 	if err != nil {
 		log.Println("write:", err)
 		return errors.New("write failed")
@@ -905,7 +908,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = WriteMessage(conn, []byte(fmt.Sprintf("{\"kind\": \"auth\", \"version\": \"%s\"}", VERSION)))
+	err = WriteMessage(conn, []byte(fmt.Sprintf(`{"kind": "auth", "version": "%s"}`, VERSION)))
 	if err != nil {
 		log.Println("write:", err)
 		return
@@ -958,7 +961,7 @@ func (serv *Server) WebSocketEndpoint(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-wakeupChannel:
 			if time.Now().Unix() > clientState.ValidityUntilUnix {
-				WriteMessage(conn, []byte("{\"kind\": \"error\", \"message\": \"auth expired\"}"))
+				WriteMessage(conn, []byte(`{"kind": "error", "message": "auth expired"}`))
 				return
 			}
 			for token, subCursor := range clientState.Cursors {
@@ -1057,8 +1060,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	if config.PostgresUrl == "" {
-		panic("Need to set postgresUrl in config file")
+	if config.DatabaseUrl == "" {
+		panic("Need to set databaseUrl in config file")
+	}
+	if config.DatabaseDriver == "" {
+		panic("Need to set databaseDriver in config file to one of: postgres, mysql, sqlite3")
 	}
 	if config.Host == "" {
 		config.Host = "0.0.0.0:10203"
@@ -1077,7 +1083,7 @@ func main() {
 	debugMode = config.DebugMode || *debugModeFlag
 
 	// Connect to the database.
-	db, err := sql.Open("postgres", config.PostgresUrl)
+	db, err := sql.Open(config.DatabaseDriver, config.DatabaseUrl)
 	if err != nil {
 		panic(err)
 	}
@@ -1167,6 +1173,7 @@ func main() {
 	}
 
 	http.HandleFunc("/ws", server.WebSocketEndpoint)
+	http.HandleFunc("/api", server.PlainEndpoint)
 	http.HandleFunc("/rest", server.PlainEndpoint)
 	if config.EnableTLS {
 		if config.CertFile == "" || config.KeyFile == "" {
