@@ -43,7 +43,7 @@ TODO:
 [ ] Possibly implement a database -> config scraper
 */
 
-const VERSION = "v0.2.3"
+const VERSION = "v0.2.4"
 const PING_PERIOD = 30 * time.Second
 const WRITE_WAIT = 10 * time.Second
 
@@ -280,8 +280,8 @@ func (serv *Server) RefreshPull(pull *TablePull, fullPrint bool) error {
 	// Select just the most recent row of each group
 	case PullNewestByGroup:
 		query = fmt.Sprintf(
-			"SELECT * FROM %s WHERE id > %v AND id IN (SELECT MAX(id) FROM %s GROUP BY %s) ORDER BY id",
-			pull.TableName, pull.MostRecentId, pull.TableName, pull.GroupByColumn,
+			"SELECT * FROM %s WHERE id IN (SELECT MAX(id) FROM %s WHERE id > %v GROUP BY %s) ORDER BY id",
+			pull.TableName, pull.TableName, pull.MostRecentId, pull.GroupByColumn,
 		)
 	// Select all rows
 	case PullAll:
